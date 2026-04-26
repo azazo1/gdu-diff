@@ -90,6 +90,7 @@ pub struct RowData {
     pub name: String,
     pub path: String,
     pub kind: EntryKind,
+    pub change_kind: ChangeKind,
     pub latest_size: u64,
     pub baseline_size: u64,
     pub delta: i64,
@@ -114,6 +115,29 @@ impl RowData {
 
     pub fn has_children(&self) -> bool {
         matches!(self.kind, EntryKind::Dir | EntryKind::Mixed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Changed,
+    Unchanged,
+}
+
+impl ChangeKind {
+    pub fn label(self) -> &'static str {
+        self.short()
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Added => "+",
+            Self::Removed => "-",
+            Self::Changed => "~",
+            Self::Unchanged => "=",
+        }
     }
 }
 
@@ -226,18 +250,35 @@ impl Analysis {
         Ok(sort_rows(rows, sort))
     }
 
+    pub fn row_for_path(&self, path: &str, metric: SizeMetric) -> Result<RowData> {
+        if path.is_empty() {
+            return self.root_row(metric);
+        }
+
+        self.build_row(path, metric)?
+            .ok_or_else(|| anyhow!("path {path} does not exist in the snapshot set"))
+    }
+
     fn build_row(&self, path: &str, metric: SizeMetric) -> Result<Option<RowData>> {
         let mut name = None;
         let mut saw_dir = false;
         let mut saw_file = false;
         let mut timeline = Vec::with_capacity(self.snapshots.len());
+        let mut first_present = false;
+        let mut last_present = false;
 
-        for snapshot in &self.snapshots {
+        for (index, snapshot) in self.snapshots.iter().enumerate() {
             let entry = snapshot.entries.get(path);
             if let Some(entry) = entry {
                 name.get_or_insert_with(|| entry.name.clone());
                 saw_dir |= entry.is_dir;
                 saw_file |= !entry.is_dir;
+            }
+            if index == 0 {
+                first_present = entry.is_some();
+            }
+            if index + 1 == self.snapshots.len() {
+                last_present = entry.is_some();
             }
 
             let size = entry.map_or(0, |entry| entry.sizes.value(metric));
@@ -274,20 +315,83 @@ impl Analysis {
         let latest_size = timeline.last().map_or(0, |point| point.size);
         let baseline_local_share = timeline.first().map_or(0.0, |point| point.local_share);
         let latest_local_share = timeline.last().map_or(0.0, |point| point.local_share);
+        let delta = latest_size as i64 - baseline_size as i64;
+        let change_kind = change_kind_from_presence_and_delta(
+            first_present,
+            last_present,
+            delta,
+            baseline_local_share,
+            latest_local_share,
+        );
 
         Ok(Some(RowData {
             name,
             path: path.to_string(),
             kind,
+            change_kind,
             latest_size,
             baseline_size,
-            delta: latest_size as i64 - baseline_size as i64,
+            delta,
             latest_local_share,
             baseline_local_share,
             local_share_delta: latest_local_share - baseline_local_share,
             timeline,
         }))
     }
+
+    fn root_row(&self, metric: SizeMetric) -> Result<RowData> {
+        let mut timeline = Vec::with_capacity(self.snapshots.len());
+        for snapshot in &self.snapshots {
+            let size = snapshot.root_sizes()?.value(metric);
+            timeline.push(TimelinePoint {
+                label: snapshot.label.clone(),
+                size,
+                local_share: 1.0,
+                root_share: 1.0,
+            });
+        }
+
+        let baseline_size = timeline.first().map_or(0, |point| point.size);
+        let latest_size = timeline.last().map_or(0, |point| point.size);
+        let delta = latest_size as i64 - baseline_size as i64;
+
+        Ok(RowData {
+            name: self.current_root_name().to_string(),
+            path: String::new(),
+            kind: EntryKind::Dir,
+            change_kind: if delta == 0 {
+                ChangeKind::Unchanged
+            } else {
+                ChangeKind::Changed
+            },
+            latest_size,
+            baseline_size,
+            delta,
+            latest_local_share: 1.0,
+            baseline_local_share: 1.0,
+            local_share_delta: 0.0,
+            timeline,
+        })
+    }
+}
+
+fn change_kind_from_presence_and_delta(
+    first_present: bool,
+    last_present: bool,
+    delta: i64,
+    baseline_local_share: f64,
+    latest_local_share: f64,
+) -> ChangeKind {
+    if !first_present && last_present {
+        return ChangeKind::Added;
+    }
+    if first_present && !last_present {
+        return ChangeKind::Removed;
+    }
+    if delta != 0 || (baseline_local_share - latest_local_share).abs() > f64::EPSILON {
+        return ChangeKind::Changed;
+    }
+    ChangeKind::Unchanged
 }
 
 impl SnapshotIndex {
@@ -397,7 +501,7 @@ mod tests {
 
     use crate::gdu::SnapshotTree;
 
-    use super::{Analysis, SizeMetric, SortMode};
+    use super::{Analysis, ChangeKind, SizeMetric, SortMode};
 
     #[test]
     fn aggregates_sizes_and_shares() -> Result<()> {
@@ -420,11 +524,13 @@ mod tests {
         assert_eq!(rows[0].baseline_size, 20);
         assert_eq!(rows[0].latest_size, 50);
         assert_eq!(rows[0].delta, 30);
+        assert_eq!(rows[0].change_kind, ChangeKind::Changed);
         assert!((rows[0].baseline_local_share - (20.0 / 60.0)).abs() < 0.0001);
         assert!((rows[0].latest_local_share - (50.0 / 68.0)).abs() < 0.0001);
 
         assert_eq!(rows[2].name, "b.bin");
         assert_eq!(rows[2].delta, -30);
+        assert_eq!(rows[2].change_kind, ChangeKind::Changed);
         Ok(())
     }
 
@@ -445,6 +551,30 @@ mod tests {
         let rows = analysis.children_of("", false, SizeMetric::Disk, SortMode::Name)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "dir");
+        Ok(())
+    }
+
+    #[test]
+    fn builds_root_row_for_current_directory_summary() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"one.bin","asize":10,"dsize":20,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"one.bin","asize":40,"dsize":50,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let root = analysis.row_for_path("", SizeMetric::Disk)?;
+
+        assert_eq!(root.kind, super::EntryKind::Dir);
+        assert_eq!(root.baseline_size, 20);
+        assert_eq!(root.latest_size, 50);
+        assert_eq!(root.delta, 30);
+        assert_eq!(root.latest_root_share(), 1.0);
         Ok(())
     }
 }

@@ -24,8 +24,8 @@ use tui::{App, run};
 struct Cli {
     #[arg(short = 'a', long = "show-apparent-size", global = true)]
     show_apparent_size: bool,
-    #[arg(short = 'f', long = "include-files", global = true)]
-    include_files: bool,
+    #[arg(long = "dirs-only", global = true)]
+    dirs_only: bool,
     #[command(subcommand)]
     command: Option<CommandKind>,
     #[arg(value_name = "ARG")]
@@ -98,7 +98,7 @@ fn run_tui(snapshots: Vec<SnapshotTree>, cli: &Cli) -> Result<()> {
     } else {
         SizeMetric::Disk
     };
-    let app = App::new(analysis, metric, cli.include_files)?;
+    let app = App::new(analysis, metric, !cli.dirs_only)?;
     run(app)
 }
 

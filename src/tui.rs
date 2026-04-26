@@ -2,6 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
+use clipboard_rs::{Clipboard, ClipboardContext};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::analysis::{Analysis, RowData, SizeMetric, SortMode};
+use crate::analysis::{Analysis, ChangeKind, RowData, SizeMetric, SortMode};
 
 pub struct App {
     analysis: Analysis,
@@ -25,6 +26,7 @@ pub struct App {
     rows: Vec<RowData>,
     table_state: TableState,
     should_quit: bool,
+    status_message: Option<StatusMessage>,
 }
 
 impl App {
@@ -38,6 +40,7 @@ impl App {
             rows: Vec::new(),
             table_state: TableState::default(),
             should_quit: false,
+            status_message: None,
         };
         app.refresh_rows()?;
         Ok(app)
@@ -79,7 +82,7 @@ impl App {
                 };
                 self.refresh_rows()?;
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('.') => {
                 self.include_files = !self.include_files;
                 self.refresh_rows()?;
             }
@@ -99,6 +102,8 @@ impl App {
                 self.sort = SortMode::ShareDelta;
                 self.refresh_rows()?;
             }
+            KeyCode::Char('c') => self.copy_relative_path(),
+            KeyCode::Char('C') => self.copy_absolute_path(),
             _ => {}
         }
         Ok(())
@@ -132,6 +137,57 @@ impl App {
         };
         self.current_path = parent;
         self.refresh_rows()
+    }
+
+    fn copy_relative_path(&mut self) {
+        let target = self.copy_target();
+        self.copy_to_clipboard(target.relative_path.clone(), "relative path");
+    }
+
+    fn copy_absolute_path(&mut self) {
+        let target = self.copy_target();
+        self.copy_to_clipboard(target.absolute_path.clone(), "absolute path");
+    }
+
+    fn copy_target(&self) -> CopyTarget {
+        if let Some(row) = self.selected_row() {
+            let relative_path = if row.path.is_empty() {
+                String::from(".")
+            } else {
+                row.path.clone()
+            };
+            return CopyTarget {
+                relative_path,
+                absolute_path: self.analysis.display_path(&row.path),
+            };
+        }
+
+        let relative_path = if self.current_path.is_empty() {
+            String::from(".")
+        } else {
+            self.current_path.clone()
+        };
+        CopyTarget {
+            relative_path,
+            absolute_path: self.analysis.display_path(&self.current_path),
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, value: String, label: &str) {
+        match ClipboardContext::new().and_then(|clipboard| clipboard.set_text(value.clone())) {
+            Ok(()) => {
+                self.status_message = Some(StatusMessage {
+                    text: format!("Copied {label}: {value}"),
+                    kind: StatusKind::Info,
+                });
+            }
+            Err(error) => {
+                self.status_message = Some(StatusMessage {
+                    text: format!("Failed to copy {label}: {error}"),
+                    kind: StatusKind::Error,
+                });
+            }
+        }
     }
 
     fn selected_detail(&self) -> Result<SelectedDetail> {
@@ -178,6 +234,11 @@ impl App {
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
+                ),
+                stat_line(
+                    "Change",
+                    selected.change_kind.label(),
+                    change_kind_style(selected.change_kind).add_modifier(Modifier::BOLD),
                 ),
             ],
             size_lines: vec![
@@ -232,42 +293,89 @@ impl App {
     fn render(&mut self, frame: &mut ratatui::Frame) -> Result<()> {
         let area = frame.area();
         frame.render_widget(Clear, area);
+        let current_dir = self
+            .analysis
+            .row_for_path(&self.current_path, self.metric)?;
 
         let chunks = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(6),
             Constraint::Min(6),
-            Constraint::Length(11),
+            Constraint::Length(12),
             Constraint::Length(3),
         ])
         .split(area);
 
         let header = Paragraph::new(vec![
-            Line::from(format!(
-                "gdu-diff  root: {}  snapshots: {}  range: {}",
-                self.analysis.current_root_name(),
-                self.analysis.snapshot_count(),
-                self.analysis.snapshot_range_label()
-            )),
-            Line::from(format!(
-                "path: {}",
-                self.analysis.display_path(&self.current_path)
-            )),
-            Line::from(format!(
-                "metric: {}  sort: {}  visible: {}",
-                self.metric.label(),
-                self.sort.label(),
-                if self.include_files {
-                    "dirs + files"
-                } else {
-                    "dirs only"
-                }
-            )),
+            Line::from(vec![
+                Span::styled(
+                    "gdu-diff  ",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("root ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.analysis.current_root_name().to_string(),
+                    directory_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled("snapshots ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.analysis.snapshot_count().to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled("range ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.analysis.snapshot_range_label(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw("  "),
+                Span::styled("metric ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.metric.label(),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            stat_line_spans("Path", {
+                let mut spans = styled_path_spans(
+                    &self.analysis.display_path(&self.current_path),
+                    crate::analysis::EntryKind::Dir,
+                );
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "visible ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    if self.include_files {
+                        "dirs + files"
+                    } else {
+                        "dirs only"
+                    },
+                    Style::default().fg(Color::Rgb(210, 210, 210)),
+                ));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("sort ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    self.sort.label(),
+                    Style::default().fg(Color::Rgb(120, 196, 255)),
+                ));
+                spans
+            }),
+            current_dir_summary_line(&current_dir),
+            status_line(self.status_message.as_ref()),
         ])
         .block(Block::default().borders(Borders::ALL).title("Overview"));
         frame.render_widget(header, chunks[0]);
 
         let header_row = Row::new(vec![
             Cell::from("Type"),
+            Cell::from("Change"),
             Cell::from("Name"),
             Cell::from("Latest"),
             Cell::from("Delta"),
@@ -280,47 +388,59 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let rows = self.rows.iter().map(|row| {
-            let delta_style = delta_style(row.delta);
-            let share_style = share_style(row.local_share_delta);
-            Row::new(vec![
-                Cell::from(row.kind.short()),
-                Cell::from(Line::from(styled_entry_name_spans(&row.name, row.kind))),
-                Cell::from(format_size(row.latest_size)),
-                Cell::from(Span::styled(format_signed_size(row.delta), delta_style)),
-                Cell::from(format!("{:.1}%", row.latest_local_share * 100.0)),
-                Cell::from(Span::styled(
-                    format_share_delta(row.local_share_delta),
-                    share_style,
-                )),
-            ])
-        });
+        if self.rows.is_empty() {
+            let empty_children = Paragraph::new(children_empty_lines(self.include_files))
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title("Children"));
+            frame.render_widget(empty_children, chunks[1]);
+        } else {
+            let rows = self.rows.iter().map(|row| {
+                let delta_style = delta_style(row.delta);
+                let share_style = share_style(row.local_share_delta);
+                Row::new(vec![
+                    Cell::from(row.kind.short()),
+                    Cell::from(Span::styled(
+                        row.change_kind.short(),
+                        change_kind_style(row.change_kind).add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Line::from(styled_entry_name_spans(&row.name, row.kind))),
+                    Cell::from(format_size(row.latest_size)),
+                    Cell::from(Span::styled(format_signed_size(row.delta), delta_style)),
+                    Cell::from(format!("{:.1}%", row.latest_local_share * 100.0)),
+                    Cell::from(Span::styled(
+                        format_share_delta(row.local_share_delta),
+                        share_style,
+                    )),
+                ])
+            });
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(6),
-                Constraint::Min(24),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(8),
-                Constraint::Length(8),
-            ],
-        )
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title("Children"))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
-        frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(6),
+                    Constraint::Length(3),
+                    Constraint::Min(24),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                ],
+            )
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title("Children"))
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            );
+            frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
+        }
 
         self.render_selected_panel(frame, chunks[2])?;
 
         let help = Paragraph::new(Line::from(
-            "j/k or arrows move  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  f files  q quit",
+            "j/k or arrows move  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  . files  c rel-path  C abs-path  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(help, chunks[3]);
@@ -346,7 +466,7 @@ impl App {
 
         let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(inner);
-        let left = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).split(columns[0]);
+        let left = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).split(columns[0]);
         let right = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(columns[1]);
 
         let item = Paragraph::new(detail.item_lines)
@@ -456,6 +576,15 @@ fn share_style(delta: f64) -> Style {
     }
 }
 
+fn change_kind_style(change_kind: ChangeKind) -> Style {
+    match change_kind {
+        ChangeKind::Added => Style::default().fg(Color::Green),
+        ChangeKind::Removed => Style::default().fg(Color::Red),
+        ChangeKind::Changed => Style::default().fg(Color::Yellow),
+        ChangeKind::Unchanged => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn compact_timeline<I>(items: I) -> String
 where
     I: IntoIterator,
@@ -505,7 +634,7 @@ fn stat_line(
 
 fn stat_line_spans(label: impl Into<String>, value_spans: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![Span::styled(
-        format!("{:<8}", label.into()),
+        format!("{:<10}", label.into()),
         Style::default().fg(Color::DarkGray),
     )];
     spans.extend(value_spans);
@@ -514,7 +643,7 @@ fn stat_line_spans(label: impl Into<String>, value_spans: Vec<Span<'static>>) ->
 
 fn share_line(label: &str, baseline: f64, latest: f64, delta: f64) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<6}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{label:<8}"), Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
                 "{baseline:.1}% -> {latest:.1}%  ",
@@ -530,23 +659,108 @@ fn share_line(label: &str, baseline: f64, latest: f64, delta: f64) -> Line<'stat
     ])
 }
 
-fn styled_entry_name_spans(name: &str, kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        name.to_string(),
-        entry_name_style(name, kind).add_modifier(Modifier::BOLD),
-    )];
-    if matches!(
-        kind,
-        crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
-    ) {
-        spans.push(Span::styled("/", directory_style()));
+fn current_dir_summary_line(row: &RowData) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("Current ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_size(row.baseline_size),
+            Style::default().fg(Color::Rgb(174, 174, 174)),
+        ),
+        Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_size(row.latest_size),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format_signed_size(row.delta),
+            delta_style(row.delta).add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if !row.path.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("P ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!(
+                "{:.1}% -> {:.1}% ",
+                row.baseline_local_share * 100.0,
+                row.latest_local_share * 100.0
+            ),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled(
+            format_share_delta(row.local_share_delta),
+            share_style(row.local_share_delta).add_modifier(Modifier::BOLD),
+        ));
     }
-    spans
+
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("R ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!(
+            "{:.1}% -> {:.1}% ",
+            row.baseline_root_share() * 100.0,
+            row.latest_root_share() * 100.0
+        ),
+        Style::default().fg(Color::White),
+    ));
+    spans.push(Span::styled(
+        format_share_delta(row.root_share_delta()),
+        share_style(row.root_share_delta()).add_modifier(Modifier::BOLD),
+    ));
+
+    Line::from(spans)
+}
+
+fn status_line(status: Option<&StatusMessage>) -> Line<'static> {
+    let Some(status) = status else {
+        return Line::from(vec![
+            Span::styled("Status  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ready", Style::default().fg(Color::Rgb(170, 170, 170))),
+        ]);
+    };
+
+    Line::from(vec![
+        Span::styled("Status  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status.text.clone(), status.kind.style()),
+    ])
+}
+
+fn children_empty_lines(include_files: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "This directory is empty.",
+        Style::default().fg(Color::DarkGray),
+    ))];
+
+    if !include_files {
+        lines.push(Line::from(Span::styled(
+            "If it only contains files, press . to show them.",
+            Style::default().fg(Color::Rgb(170, 170, 170)),
+        )));
+    }
+
+    lines
+}
+
+fn styled_entry_name_spans(name: &str, kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
+    match kind {
+        crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed => vec![
+            Span::styled(
+                name.to_string(),
+                directory_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("/", separator_style()),
+        ],
+        crate::analysis::EntryKind::File => styled_file_name_spans(name),
+    }
 }
 
 fn styled_path_spans(path: &str, final_kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
     if path == "/" {
-        return vec![Span::styled("/", directory_style())];
+        return vec![Span::styled("/", separator_style())];
     }
 
     let mut spans = Vec::new();
@@ -567,56 +781,107 @@ fn styled_path_spans(path: &str, final_kind: crate::analysis::EntryKind) -> Vec<
         } else {
             crate::analysis::EntryKind::Dir
         };
-        spans.push(Span::styled(
-            (*component).to_string(),
-            entry_name_style(component, kind).add_modifier(Modifier::BOLD),
-        ));
+        let mut component_spans = styled_entry_name_spans(component, kind);
+        if !is_last
+            && matches!(
+                kind,
+                crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
+            )
+        {
+            component_spans.pop();
+        }
+        spans.extend(component_spans);
 
         if !is_last {
             spans.push(Span::styled("/", separator_style()));
-        } else if matches!(
-            kind,
-            crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
-        ) {
-            spans.push(Span::styled("/", directory_style()));
         }
     }
 
     spans
 }
 
-fn entry_name_style(name: &str, kind: crate::analysis::EntryKind) -> Style {
-    if matches!(
-        kind,
-        crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
-    ) {
-        return directory_style();
-    }
-
+fn styled_file_name_spans(name: &str) -> Vec<Span<'static>> {
     if name.starts_with('.') {
-        return Style::default().fg(Color::Rgb(198, 198, 198));
+        return vec![Span::styled(
+            name.to_string(),
+            hidden_style().add_modifier(Modifier::BOLD),
+        )];
     }
 
-    match extension(name) {
-        Some("json" | "jsonl" | "json5") => Style::default().fg(Color::Rgb(215, 0, 255)),
-        Some("toml" | "yaml" | "yml") => Style::default().fg(Color::Rgb(255, 176, 0)),
-        Some("rs" | "go" | "py" | "sh" | "bash" | "zsh") => {
-            Style::default().fg(Color::Rgb(107, 214, 114))
-        }
-        Some("md" | "txt") => Style::default().fg(Color::Rgb(224, 224, 224)),
-        _ => Style::default().fg(Color::Rgb(235, 235, 235)),
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return vec![Span::styled(
+            name.to_string(),
+            regular_file_style().add_modifier(Modifier::BOLD),
+        )];
+    };
+
+    if stem.is_empty() || extension.is_empty() {
+        return vec![Span::styled(
+            name.to_string(),
+            regular_file_style().add_modifier(Modifier::BOLD),
+        )];
     }
+
+    vec![
+        Span::styled(
+            stem.to_string(),
+            regular_file_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(".{extension}"),
+            extension_style(extension).add_modifier(Modifier::BOLD),
+        ),
+    ]
 }
 
 fn directory_style() -> Style {
     Style::default().fg(Color::Rgb(36, 148, 255))
 }
 
+fn hidden_style() -> Style {
+    Style::default().fg(Color::Rgb(198, 198, 198))
+}
+
+fn regular_file_style() -> Style {
+    Style::default().fg(Color::Rgb(235, 235, 235))
+}
+
 fn separator_style() -> Style {
     Style::default().fg(Color::Rgb(214, 214, 214))
 }
 
-fn extension(name: &str) -> Option<&str> {
-    let (_, extension) = name.rsplit_once('.')?;
-    (!extension.is_empty()).then_some(extension)
+fn extension_style(extension: &str) -> Style {
+    match extension {
+        "json" | "jsonl" | "json5" => Style::default().fg(Color::Rgb(215, 0, 255)),
+        "toml" | "yaml" | "yml" => Style::default().fg(Color::Rgb(255, 176, 0)),
+        "rs" | "go" | "py" | "sh" | "bash" | "zsh" => {
+            Style::default().fg(Color::Rgb(107, 214, 114))
+        }
+        "md" | "txt" => Style::default().fg(Color::Rgb(224, 224, 224)),
+        _ => regular_file_style(),
+    }
+}
+
+struct CopyTarget {
+    relative_path: String,
+    absolute_path: String,
+}
+
+struct StatusMessage {
+    text: String,
+    kind: StatusKind,
+}
+
+enum StatusKind {
+    Info,
+    Error,
+}
+
+impl StatusKind {
+    fn style(&self) -> Style {
+        match self {
+            Self::Info => Style::default().fg(Color::Rgb(170, 170, 170)),
+            Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        }
+    }
 }
