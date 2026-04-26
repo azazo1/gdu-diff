@@ -3,8 +3,8 @@ mod gdu;
 mod store;
 mod tui;
 
-use std::env;
 use std::path::PathBuf;
+use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -119,7 +119,7 @@ fn classify_action(cli: &Cli) -> Result<Action> {
         });
     }
 
-    if cli.args.len() >= 2 && cli.args.iter().all(|path| is_json_file_arg(path)) {
+    if cli.args.len() >= 2 && cli.args.iter().all(|x| is_json_file_arg(x)) {
         return Ok(Action::CompareFiles {
             files: cli.args.clone(),
         });
@@ -138,11 +138,11 @@ fn classify_action(cli: &Cli) -> Result<Action> {
     )
 }
 
-fn is_json_file_arg(path: &PathBuf) -> bool {
+fn is_json_file_arg(path: &Path) -> bool {
     is_json_like_path(path)
 }
 
-fn is_json_like_path(path: &PathBuf) -> bool {
+fn is_json_like_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))

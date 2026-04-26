@@ -320,12 +320,11 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
             return Ok(());
         }
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key.code)?;
-                }
-            }
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key.code)?;
         }
     }
 }
