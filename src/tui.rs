@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContext};
@@ -228,28 +228,14 @@ impl App {
 
         Ok(SelectedDetail {
             is_empty: false,
-            item_lines: vec![
-                stat_line_spans(
-                    "Name",
-                    styled_entry_name_spans(&selected.name, selected.kind),
-                ),
-                stat_line_spans(
-                    "Path",
-                    styled_path_spans(&self.analysis.display_path(&selected.path), selected.kind),
-                ),
-                stat_line(
-                    "Type",
-                    selected.kind.label(),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                stat_line(
-                    "Change",
-                    selected.change_kind.label(),
-                    change_kind_style(selected.change_kind).add_modifier(Modifier::BOLD),
-                ),
-            ],
+            name_spans: styled_entry_name_spans(&selected.name, selected.kind),
+            path_spans: styled_path_spans(
+                &self.analysis.display_path(&selected.path),
+                selected.kind,
+            ),
+            kind_label: selected.kind.label().to_string(),
+            change_label: selected.change_kind.label().to_string(),
+            change_kind: selected.change_kind,
             size_lines: vec![
                 stat_line(
                     "Baseline",
@@ -479,10 +465,7 @@ impl App {
         let left = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).split(columns[0]);
         let right = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(columns[1]);
 
-        let item = Paragraph::new(detail.item_lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Item"));
-        frame.render_widget(item, left[0]);
+        self.render_selected_item_panel(frame, left[0], &detail);
 
         let size = Paragraph::new(detail.size_lines)
             .wrap(Wrap { trim: false })
@@ -500,6 +483,65 @@ impl App {
         frame.render_widget(timeline, right[1]);
 
         Ok(())
+    }
+
+    fn render_selected_item_panel(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        detail: &SelectedDetail,
+    ) {
+        let block = Block::default().borders(Borders::ALL).title("Item");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+        render_key_value_row(
+            frame,
+            rows[0],
+            "Name",
+            Line::from(detail.name_spans.clone()),
+            0,
+        );
+        render_key_value_row(
+            frame,
+            rows[1],
+            "Path",
+            Line::from(detail.path_spans.clone()),
+            marquee_offset(
+                spans_width(&detail.path_spans),
+                value_area_width(rows[1], DETAIL_LABEL_WIDTH),
+            ),
+        );
+        render_key_value_row(
+            frame,
+            rows[2],
+            "Type",
+            Line::from(Span::styled(
+                detail.kind_label.clone(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            0,
+        );
+        render_key_value_row(
+            frame,
+            rows[3],
+            "Change",
+            Line::from(Span::styled(
+                detail.change_label.clone(),
+                change_kind_style(detail.change_kind).add_modifier(Modifier::BOLD),
+            )),
+            0,
+        );
     }
 }
 
@@ -616,7 +658,11 @@ where
 
 struct SelectedDetail {
     is_empty: bool,
-    item_lines: Vec<Line<'static>>,
+    name_spans: Vec<Span<'static>>,
+    path_spans: Vec<Span<'static>>,
+    kind_label: String,
+    change_label: String,
+    change_kind: ChangeKind,
     size_lines: Vec<Line<'static>>,
     share_lines: Vec<Line<'static>>,
     timeline_lines: Vec<Line<'static>>,
@@ -626,13 +672,19 @@ impl SelectedDetail {
     fn empty() -> Self {
         Self {
             is_empty: true,
-            item_lines: Vec::new(),
+            name_spans: Vec::new(),
+            path_spans: Vec::new(),
+            kind_label: String::new(),
+            change_label: String::new(),
+            change_kind: ChangeKind::Unchanged,
             size_lines: Vec::new(),
             share_lines: Vec::new(),
             timeline_lines: Vec::new(),
         }
     }
 }
+
+const DETAIL_LABEL_WIDTH: u16 = 10;
 
 fn stat_line(
     label: impl Into<String>,
@@ -644,11 +696,74 @@ fn stat_line(
 
 fn stat_line_spans(label: impl Into<String>, value_spans: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![Span::styled(
-        format!("{:<10}", label.into()),
+        format!(
+            "{:<DETAIL_LABEL_WIDTH$}",
+            label.into(),
+            DETAIL_LABEL_WIDTH = DETAIL_LABEL_WIDTH as usize
+        ),
         Style::default().fg(Color::DarkGray),
     )];
     spans.extend(value_spans);
     Line::from(spans)
+}
+
+fn render_key_value_row(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    label: &str,
+    value: Line<'static>,
+    scroll_x: u16,
+) {
+    let parts = Layout::horizontal([Constraint::Length(DETAIL_LABEL_WIDTH), Constraint::Min(1)])
+        .split(area);
+    let label = Paragraph::new(Line::from(Span::styled(
+        format!(
+            "{label:<DETAIL_LABEL_WIDTH$}",
+            DETAIL_LABEL_WIDTH = DETAIL_LABEL_WIDTH as usize
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(label, parts[0]);
+    let value = Paragraph::new(value).scroll((0, scroll_x));
+    frame.render_widget(value, parts[1]);
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
+}
+
+fn value_area_width(area: Rect, label_width: u16) -> usize {
+    usize::from(area.width.saturating_sub(label_width))
+}
+
+fn marquee_offset(content_width: usize, viewport_width: usize) -> u16 {
+    if viewport_width == 0 || content_width <= viewport_width {
+        return 0;
+    }
+
+    let overflow = content_width - viewport_width;
+    let pause = 4usize;
+    let cycle = pause + overflow + pause + overflow;
+    let tick = marquee_tick() % cycle;
+
+    let offset = if tick < pause {
+        0
+    } else if tick < pause + overflow {
+        tick - pause
+    } else if tick < pause + overflow + pause {
+        overflow
+    } else {
+        overflow - (tick - pause - overflow - pause)
+    };
+
+    offset.min(u16::MAX as usize) as u16
+}
+
+fn marquee_tick() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 250) as usize)
+        .unwrap_or_default()
 }
 
 fn share_line(label: &str, baseline: f64, latest: f64, delta: f64) -> Line<'static> {
