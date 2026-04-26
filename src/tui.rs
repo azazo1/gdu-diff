@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Margin};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
@@ -134,9 +134,9 @@ impl App {
         self.refresh_rows()
     }
 
-    fn selected_detail(&self) -> Result<Vec<Line<'static>>> {
+    fn selected_detail(&self) -> Result<SelectedDetail> {
         let Some(selected) = self.selected_row() else {
-            return Ok(vec![Line::from("No entries in this directory.")]);
+            return Ok(SelectedDetail::empty());
         };
 
         let timeline_labels = compact_timeline(
@@ -161,34 +161,72 @@ impl App {
                 .collect::<Vec<_>>(),
         );
 
-        Ok(vec![
-            Line::from(format!(
-                "Selected: {} ({})",
-                self.analysis.display_path(&selected.path),
-                selected.kind.label()
-            )),
-            Line::from(format!(
-                "Size: {} -> {} ({})",
-                format_size(selected.baseline_size),
-                format_size(selected.latest_size),
-                format_signed_size(selected.delta)
-            )),
-            Line::from(format!(
-                "Share in parent: {:.1}% -> {:.1}% ({})",
-                selected.baseline_local_share * 100.0,
-                selected.latest_local_share * 100.0,
-                format_share_delta(selected.local_share_delta)
-            )),
-            Line::from(format!(
-                "Share in root: {:.1}% -> {:.1}% ({})",
-                selected.baseline_root_share() * 100.0,
-                selected.latest_root_share() * 100.0,
-                format_share_delta(selected.root_share_delta())
-            )),
-            Line::from(format!("Labels: {timeline_labels}")),
-            Line::from(format!("Sizes : {timeline_sizes}")),
-            Line::from(format!("Share : {timeline_shares}")),
-        ])
+        Ok(SelectedDetail {
+            is_empty: false,
+            item_lines: vec![
+                stat_line_spans(
+                    "Name",
+                    styled_entry_name_spans(&selected.name, selected.kind),
+                ),
+                stat_line_spans(
+                    "Path",
+                    styled_path_spans(&self.analysis.display_path(&selected.path), selected.kind),
+                ),
+                stat_line(
+                    "Type",
+                    selected.kind.label(),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            size_lines: vec![
+                stat_line(
+                    "Baseline",
+                    format_size(selected.baseline_size),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                stat_line(
+                    "Latest",
+                    format_size(selected.latest_size),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                stat_line(
+                    "Delta",
+                    format_signed_size(selected.delta),
+                    delta_style(selected.delta).add_modifier(Modifier::BOLD),
+                ),
+            ],
+            share_lines: vec![
+                share_line(
+                    "Parent",
+                    selected.baseline_local_share,
+                    selected.latest_local_share,
+                    selected.local_share_delta,
+                ),
+                share_line(
+                    "Root",
+                    selected.baseline_root_share(),
+                    selected.latest_root_share(),
+                    selected.root_share_delta(),
+                ),
+            ],
+            timeline_lines: vec![
+                stat_line(
+                    "Labels",
+                    timeline_labels,
+                    Style::default().fg(Color::DarkGray),
+                ),
+                stat_line("Sizes", timeline_sizes, Style::default().fg(Color::Cyan)),
+                stat_line(
+                    "Parent",
+                    timeline_shares,
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        })
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) -> Result<()> {
@@ -198,8 +236,8 @@ impl App {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(8),
-            Constraint::Length(2),
+            Constraint::Length(11),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -247,7 +285,7 @@ impl App {
             let share_style = share_style(row.local_share_delta);
             Row::new(vec![
                 Cell::from(row.kind.short()),
-                Cell::from(row.name.clone()),
+                Cell::from(Line::from(styled_entry_name_spans(&row.name, row.kind))),
                 Cell::from(format_size(row.latest_size)),
                 Cell::from(Span::styled(format_signed_size(row.delta), delta_style)),
                 Cell::from(format!("{:.1}%", row.latest_local_share * 100.0)),
@@ -279,16 +317,57 @@ impl App {
         );
         frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
-        let detail = Paragraph::new(self.selected_detail()?)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Selected"));
-        frame.render_widget(detail, chunks[2]);
+        self.render_selected_panel(frame, chunks[2])?;
 
         let help = Paragraph::new(Line::from(
             "j/k or arrows move  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  f files  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
-        frame.render_widget(help, chunks[3].inner(Margin::new(0, 0)));
+        frame.render_widget(help, chunks[3]);
+
+        Ok(())
+    }
+
+    fn render_selected_panel(&self, frame: &mut ratatui::Frame, area: Rect) -> Result<()> {
+        let block = Block::default().borders(Borders::ALL).title("Selected");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let detail = self.selected_detail()?;
+        if detail.is_empty {
+            let empty = Paragraph::new(Line::from(Span::styled(
+                "No entries in this directory.",
+                Style::default().fg(Color::DarkGray),
+            )))
+            .block(Block::default().borders(Borders::ALL).title("Item"));
+            frame.render_widget(empty, inner);
+            return Ok(());
+        }
+
+        let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(inner);
+        let left = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).split(columns[0]);
+        let right = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(columns[1]);
+
+        let item = Paragraph::new(detail.item_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Item"));
+        frame.render_widget(item, left[0]);
+
+        let size = Paragraph::new(detail.size_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Size"));
+        frame.render_widget(size, left[1]);
+
+        let share = Paragraph::new(detail.share_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Share"));
+        frame.render_widget(share, right[0]);
+
+        let timeline = Paragraph::new(detail.timeline_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Timeline"));
+        frame.render_widget(timeline, right[1]);
 
         Ok(())
     }
@@ -394,4 +473,150 @@ where
     compact.push(String::from("..."));
     compact.extend(values.iter().rev().take(2).cloned().rev());
     compact.join(" | ")
+}
+
+struct SelectedDetail {
+    is_empty: bool,
+    item_lines: Vec<Line<'static>>,
+    size_lines: Vec<Line<'static>>,
+    share_lines: Vec<Line<'static>>,
+    timeline_lines: Vec<Line<'static>>,
+}
+
+impl SelectedDetail {
+    fn empty() -> Self {
+        Self {
+            is_empty: true,
+            item_lines: Vec::new(),
+            size_lines: Vec::new(),
+            share_lines: Vec::new(),
+            timeline_lines: Vec::new(),
+        }
+    }
+}
+
+fn stat_line(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_style: Style,
+) -> Line<'static> {
+    stat_line_spans(label, vec![Span::styled(value.into(), value_style)])
+}
+
+fn stat_line_spans(label: impl Into<String>, value_spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{:<8}", label.into()),
+        Style::default().fg(Color::DarkGray),
+    )];
+    spans.extend(value_spans);
+    Line::from(spans)
+}
+
+fn share_line(label: &str, baseline: f64, latest: f64, delta: f64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<6}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "{baseline:.1}% -> {latest:.1}%  ",
+                baseline = baseline * 100.0,
+                latest = latest * 100.0
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format_share_delta(delta),
+            share_style(delta).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn styled_entry_name_spans(name: &str, kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        name.to_string(),
+        entry_name_style(name, kind).add_modifier(Modifier::BOLD),
+    )];
+    if matches!(
+        kind,
+        crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
+    ) {
+        spans.push(Span::styled("/", directory_style()));
+    }
+    spans
+}
+
+fn styled_path_spans(path: &str, final_kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
+    if path == "/" {
+        return vec![Span::styled("/", directory_style())];
+    }
+
+    let mut spans = Vec::new();
+    let has_root = path.starts_with('/');
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+
+    if has_root {
+        spans.push(Span::styled("/", separator_style()));
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let is_last = index + 1 == components.len();
+        let kind = if is_last {
+            final_kind
+        } else {
+            crate::analysis::EntryKind::Dir
+        };
+        spans.push(Span::styled(
+            (*component).to_string(),
+            entry_name_style(component, kind).add_modifier(Modifier::BOLD),
+        ));
+
+        if !is_last {
+            spans.push(Span::styled("/", separator_style()));
+        } else if matches!(
+            kind,
+            crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
+        ) {
+            spans.push(Span::styled("/", directory_style()));
+        }
+    }
+
+    spans
+}
+
+fn entry_name_style(name: &str, kind: crate::analysis::EntryKind) -> Style {
+    if matches!(
+        kind,
+        crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed
+    ) {
+        return directory_style();
+    }
+
+    if name.starts_with('.') {
+        return Style::default().fg(Color::Rgb(198, 198, 198));
+    }
+
+    match extension(name) {
+        Some("json" | "jsonl" | "json5") => Style::default().fg(Color::Rgb(215, 0, 255)),
+        Some("toml" | "yaml" | "yml") => Style::default().fg(Color::Rgb(255, 176, 0)),
+        Some("rs" | "go" | "py" | "sh" | "bash" | "zsh") => {
+            Style::default().fg(Color::Rgb(107, 214, 114))
+        }
+        Some("md" | "txt") => Style::default().fg(Color::Rgb(224, 224, 224)),
+        _ => Style::default().fg(Color::Rgb(235, 235, 235)),
+    }
+}
+
+fn directory_style() -> Style {
+    Style::default().fg(Color::Rgb(36, 148, 255))
+}
+
+fn separator_style() -> Style {
+    Style::default().fg(Color::Rgb(214, 214, 214))
+}
+
+fn extension(name: &str) -> Option<&str> {
+    let (_, extension) = name.rsplit_once('.')?;
+    (!extension.is_empty()).then_some(extension)
 }
