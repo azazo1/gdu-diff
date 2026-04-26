@@ -10,6 +10,7 @@ use crate::gdu::{SnapshotTree, export_snapshot};
 
 const APPLICATION: &str = "gdu-diff";
 const MAX_BUCKET_NAME_LEN: usize = 120;
+const MAX_SHOTS_PER_BUCKET: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct StoredSnapshot {
@@ -61,6 +62,7 @@ impl SnapshotStore {
             .and_then(OsStr::to_str)
             .map_or_else(|| String::from("snapshot"), str::to_owned);
         let snapshot = SnapshotTree::load_with_label(final_path.clone(), label)?;
+        self.prune_bucket(&bucket)?;
         Ok(StoredSnapshot {
             source: final_path,
             snapshot,
@@ -131,6 +133,49 @@ impl SnapshotStore {
             "too many snapshots with the same timestamp in {}",
             bucket.display()
         )
+    }
+
+    fn prune_bucket(&self, bucket: &Path) -> Result<()> {
+        let mut snapshots = self.load_snapshots_in_bucket(bucket)?;
+        if snapshots.len() <= MAX_SHOTS_PER_BUCKET {
+            return Ok(());
+        }
+
+        snapshots.sort_by(compare_snapshot_order);
+        let remove_count = snapshots.len() - MAX_SHOTS_PER_BUCKET;
+        for snapshot in snapshots.into_iter().take(remove_count) {
+            fs::remove_file(&snapshot.source).with_context(|| {
+                format!(
+                    "failed to remove old snapshot {}",
+                    snapshot.source.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn load_snapshots_in_bucket(&self, bucket: &Path) -> Result<Vec<StoredSnapshot>> {
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(bucket)
+            .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(OsStr::to_str) != Some("json") {
+                continue;
+            }
+
+            let label = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .map_or_else(|| String::from("snapshot"), str::to_owned);
+            let snapshot = SnapshotTree::load_with_label(path.clone(), label)?;
+            snapshots.push(StoredSnapshot {
+                source: path,
+                snapshot,
+            });
+        }
+        Ok(snapshots)
     }
 }
 
@@ -216,8 +261,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MAX_BUCKET_NAME_LEN, SnapshotStore, StoredSnapshot, compare_snapshot_order,
-        encode_bucket_name,
+        MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, StoredSnapshot,
+        compare_snapshot_order, encode_bucket_name,
     };
     use crate::gdu::SnapshotTree;
 
@@ -269,6 +314,41 @@ mod tests {
     fn store_can_be_created() -> Result<()> {
         let store = SnapshotStore::new()?;
         assert!(store.data_dir().is_absolute());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_bucket_keeps_only_latest_three_shots() -> Result<()> {
+        let dir = tempdir()?;
+        let snapshots_dir = dir.path().join("snapshots");
+        let bucket = snapshots_dir.join("bucket");
+        fs::create_dir_all(&bucket)?;
+
+        for timestamp in [10, 20, 30, 40] {
+            let path = bucket.join(format!("shot-{timestamp}.json"));
+            fs::write(
+                &path,
+                format!(
+                    r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":1,"dsize":1,"mtime":1}}]]"#
+                ),
+            )?;
+        }
+
+        let store = SnapshotStore {
+            data_dir: dir.path().to_path_buf(),
+            snapshots_dir,
+        };
+        store.prune_bucket(&bucket)?;
+
+        let mut remaining = store
+            .load_snapshots_in_bucket(&bucket)?
+            .into_iter()
+            .map(|snapshot| snapshot.snapshot.exported_at.unwrap_or_default())
+            .collect::<Vec<_>>();
+        remaining.sort_unstable();
+
+        assert_eq!(remaining.len(), MAX_SHOTS_PER_BUCKET);
+        assert_eq!(remaining, vec![20, 30, 40]);
         Ok(())
     }
 }
