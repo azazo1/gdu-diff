@@ -401,13 +401,23 @@ impl App {
             .analysis
             .row_for_path(&self.current_path, self.metric)?;
 
-        let chunks = Layout::vertical([
-            Constraint::Length(6),
-            Constraint::Min(6),
-            Constraint::Length(12),
-            Constraint::Length(3),
-        ])
-        .split(area);
+        let show_selected_panel = should_show_selected_panel(area);
+        let chunks = if show_selected_panel {
+            Layout::vertical([
+                Constraint::Length(6),
+                Constraint::Min(6),
+                Constraint::Length(12),
+                Constraint::Length(3),
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Length(6),
+                Constraint::Min(6),
+                Constraint::Length(3),
+            ])
+            .split(area)
+        };
         self.page_step = children_page_step(chunks[1]);
 
         let header = Paragraph::new(vec![
@@ -555,13 +565,15 @@ impl App {
             frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
         }
 
-        self.render_selected_panel(frame, chunks[2])?;
+        if show_selected_panel {
+            self.render_selected_panel(frame, chunks[2])?;
+        }
 
         let help = Paragraph::new(Line::from(
             "j/k move  space mark  g/G ends  l open  h up  ? help  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(help, chunks[if show_selected_panel { 3 } else { 2 }]);
 
         if self.show_help {
             self.render_help_overlay(frame);
@@ -1222,6 +1234,10 @@ fn children_page_step(area: Rect) -> usize {
     usize::from(area.height.saturating_sub(3)).max(1)
 }
 
+fn should_show_selected_panel(area: Rect) -> bool {
+    area.width >= 110 && area.height >= 28
+}
+
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let vertical = Layout::vertical([
         Constraint::Percentage((100 - height_percent) / 2),
@@ -1388,7 +1404,9 @@ mod tests {
     use crate::analysis::{Analysis, SizeMetric, SortMode};
     use crate::gdu::SnapshotTree;
 
-    use super::{App, AppAction};
+    use ratatui::layout::Rect;
+
+    use super::{App, AppAction, should_show_selected_panel};
 
     #[test]
     fn go_parent_reselects_the_directory_we_came_from() -> Result<()> {
@@ -1505,5 +1523,11 @@ mod tests {
         assert_eq!(app.marked_summary().map(|summary| summary.count), Some(2));
 
         Ok(())
+    }
+
+    #[test]
+    fn hides_selected_panel_in_small_terminal() {
+        assert!(!should_show_selected_panel(Rect::new(0, 0, 100, 27)));
+        assert!(should_show_selected_panel(Rect::new(0, 0, 110, 28)));
     }
 }
