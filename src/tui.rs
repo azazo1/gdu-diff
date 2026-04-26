@@ -1,7 +1,9 @@
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clipboard_rs::{Clipboard, ClipboardContext};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -26,6 +28,7 @@ pub struct App {
     rows: Vec<RowData>,
     table_state: TableState,
     page_step: usize,
+    show_help: bool,
     should_quit: bool,
     status_message: Option<StatusMessage>,
 }
@@ -41,6 +44,7 @@ impl App {
             rows: Vec::new(),
             table_state: TableState::default(),
             page_step: 1,
+            show_help: false,
             should_quit: false,
             status_message: None,
         };
@@ -49,7 +53,12 @@ impl App {
     }
 
     fn refresh_rows(&mut self) -> Result<()> {
-        let selected_path = self.selected_row().map(|row| row.path.clone());
+        self.refresh_rows_with_selection(None)
+    }
+
+    fn refresh_rows_with_selection(&mut self, preferred_path: Option<String>) -> Result<()> {
+        let selected_path =
+            preferred_path.or_else(|| self.selected_row().map(|row| row.path.clone()));
         self.rows = self.analysis.children_of(
             &self.current_path,
             self.include_files,
@@ -70,13 +79,25 @@ impl App {
             .and_then(|index| self.rows.get(index))
     }
 
-    fn on_key(&mut self, code: KeyCode) -> Result<()> {
+    fn on_key(&mut self, code: KeyCode) -> Result<AppAction> {
+        if self.show_help {
+            match code {
+                KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            }
+            return Ok(AppAction::None);
+        }
+
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {}
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp | KeyCode::Char(',') => self.move_selection_page(-1),
             KeyCode::PageDown | KeyCode::Char('.') => self.move_selection_page(1),
+            KeyCode::Char('g') => self.move_selection_to_start(),
+            KeyCode::Char('G') => self.move_selection_to_end(),
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter_selected()?,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent()?,
             KeyCode::Char('a') => {
@@ -108,9 +129,11 @@ impl App {
             }
             KeyCode::Char('c') => self.copy_relative_path(),
             KeyCode::Char('C') => self.copy_absolute_path(),
+            KeyCode::Char('b') => return Ok(AppAction::OpenShell(self.current_directory_path())),
+            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
-        Ok(())
+        Ok(AppAction::None)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -128,6 +151,22 @@ impl App {
         self.move_selection(step * direction);
     }
 
+    fn move_selection_to_start(&mut self) {
+        if self.rows.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        self.table_state.select(Some(0));
+    }
+
+    fn move_selection_to_end(&mut self) {
+        if self.rows.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        self.table_state.select(Some(self.rows.len() - 1));
+    }
+
     fn enter_selected(&mut self) -> Result<()> {
         let Some(path) = self
             .selected_row()
@@ -141,11 +180,12 @@ impl App {
     }
 
     fn go_parent(&mut self) -> Result<()> {
+        let child_path = self.current_path.clone();
         let Some(parent) = Analysis::parent_path(&self.current_path) else {
             return Ok(());
         };
         self.current_path = parent;
-        self.refresh_rows()
+        self.refresh_rows_with_selection(Some(child_path))
     }
 
     fn copy_relative_path(&mut self) {
@@ -182,21 +222,26 @@ impl App {
         }
     }
 
+    fn current_directory_path(&self) -> PathBuf {
+        PathBuf::from(self.analysis.display_path(&self.current_path))
+    }
+
     fn copy_to_clipboard(&mut self, value: String, label: &str) {
         match ClipboardContext::new().and_then(|clipboard| clipboard.set_text(value.clone())) {
             Ok(()) => {
-                self.status_message = Some(StatusMessage {
-                    text: format!("Copied {label}: {value}"),
-                    kind: StatusKind::Info,
-                });
+                self.set_status(format!("Copied {label}: {value}"), StatusKind::Info);
             }
             Err(error) => {
-                self.status_message = Some(StatusMessage {
-                    text: format!("Failed to copy {label}: {error}"),
-                    kind: StatusKind::Error,
-                });
+                self.set_status(
+                    format!("Failed to copy {label}: {error}"),
+                    StatusKind::Error,
+                );
             }
         }
+    }
+
+    fn set_status(&mut self, text: String, kind: StatusKind) {
+        self.status_message = Some(StatusMessage { text, kind });
     }
 
     fn selected_detail(&self) -> Result<SelectedDetail> {
@@ -436,10 +481,14 @@ impl App {
         self.render_selected_panel(frame, chunks[2])?;
 
         let help = Paragraph::new(Line::from(
-            "j/k or arrows move  ,/. page  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  f files  c rel-path  C abs-path  q quit",
+            "j/k move  g/G ends  l open  h up  b shell  ? help  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(help, chunks[3]);
+
+        if self.show_help {
+            self.render_help_overlay(frame);
+        }
 
         Ok(())
     }
@@ -543,6 +592,44 @@ impl App {
             0,
         );
     }
+
+    fn render_help_overlay(&self, frame: &mut ratatui::Frame) {
+        let area = centered_rect(frame.area(), 78, 74);
+        let lines = vec![
+            Line::from(Span::styled(
+                "Navigation",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("j/k or arrows move, ,/. page, g/G jump to first/last"),
+            Line::from("l or Enter opens a directory, h or Backspace goes to parent"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "View",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("d delta sort (default), s size sort, p share sort, n name sort"),
+            Line::from("a toggles disk/apparent, f toggles files"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Actions",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("c copies relative path, C copies absolute path"),
+            Line::from("b opens a shell in the current view directory"),
+            Line::from("q quits, Esc closes this help"),
+        ];
+        let help = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Help"));
+        frame.render_widget(Clear, area);
+        frame.render_widget(help, area);
+    }
 }
 
 pub fn run(mut app: App) -> Result<()> {
@@ -575,9 +662,70 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            app.on_key(key.code)?;
+            match app.on_key(key.code)? {
+                AppAction::None => {}
+                AppAction::OpenShell(path) => open_shell(terminal, app, &path)?,
+            }
         }
     }
+}
+
+fn open_shell(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    path: &Path,
+) -> Result<()> {
+    suspend_terminal(terminal)?;
+    let shell_result = spawn_shell(path);
+    let resume_result = resume_terminal(terminal);
+
+    match (shell_result, resume_result) {
+        (Ok(()), Ok(())) => {
+            app.set_status(
+                format!("Returned from shell: {}", path.display()),
+                StatusKind::Info,
+            );
+            Ok(())
+        }
+        (Err(shell_error), Ok(())) => {
+            app.set_status(
+                format!("Failed to open shell: {shell_error}"),
+                StatusKind::Error,
+            );
+            Ok(())
+        }
+        (_, Err(resume_error)) => Err(resume_error),
+    }
+}
+
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    Ok(())
+}
+
+fn spawn_shell(path: &Path) -> Result<()> {
+    let shell = if cfg!(windows) {
+        std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd".into())
+    } else {
+        std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into())
+    };
+    let status = Command::new(&shell)
+        .current_dir(path)
+        .status()
+        .with_context(|| format!("failed to start shell in {}", path.display()))?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("shell exited with status {status}");
 }
 
 fn format_size(size: u64) -> String {
@@ -666,6 +814,11 @@ struct SelectedDetail {
     size_lines: Vec<Line<'static>>,
     share_lines: Vec<Line<'static>>,
     timeline_lines: Vec<Line<'static>>,
+}
+
+enum AppAction {
+    None,
+    OpenShell(PathBuf),
 }
 
 impl SelectedDetail {
@@ -874,6 +1027,21 @@ fn children_page_step(area: Rect) -> usize {
     usize::from(area.height.saturating_sub(3)).max(1)
 }
 
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - height_percent) / 2),
+        Constraint::Percentage(height_percent),
+        Constraint::Percentage((100 - height_percent) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - width_percent) / 2),
+        Constraint::Percentage(width_percent),
+        Constraint::Percentage((100 - width_percent) / 2),
+    ])
+    .split(vertical[1])[1]
+}
+
 fn styled_entry_name_spans(name: &str, kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
     match kind {
         crate::analysis::EntryKind::Dir | crate::analysis::EntryKind::Mixed => vec![
@@ -1012,5 +1180,49 @@ impl StatusKind {
             Self::Info => Style::default().fg(Color::Rgb(170, 170, 170)),
             Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+
+    use crate::analysis::{Analysis, SizeMetric, SortMode};
+    use crate::gdu::SnapshotTree;
+
+    use super::App;
+
+    #[test]
+    fn go_parent_reselects_the_directory_we_came_from() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":10,"dsize":10,"mtime":1}],{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":20,"dsize":20,"mtime":1}],{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let mut app = App::new(analysis, SizeMetric::Disk, true)?;
+        app.sort = SortMode::Name;
+        app.refresh_rows()?;
+        let selected_index = app
+            .rows
+            .iter()
+            .position(|row| row.path == "a")
+            .expect("directory a should exist");
+        app.table_state.select(Some(selected_index));
+
+        app.enter_selected()?;
+        app.go_parent()?;
+
+        assert_eq!(app.current_path, "");
+        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("a"));
+        Ok(())
     }
 }

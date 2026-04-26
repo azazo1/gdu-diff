@@ -162,11 +162,9 @@ fn classify_action(cli: &Cli) -> Result<Action> {
 }
 
 fn is_json_like_path(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 #[cfg(test)]
