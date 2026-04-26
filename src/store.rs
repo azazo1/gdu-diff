@@ -9,6 +9,7 @@ use dirs_next::data_dir;
 use crate::gdu::{SnapshotTree, export_snapshot};
 
 const APPLICATION: &str = "gdu-diff";
+const MAX_BUCKET_NAME_LEN: usize = 120;
 
 #[derive(Clone, Debug)]
 pub struct StoredSnapshot {
@@ -163,7 +164,21 @@ fn encode_bucket_name(input: &str) -> String {
             }
         }
     }
-    encoded
+
+    if encoded.len() <= MAX_BUCKET_NAME_LEN {
+        return encoded;
+    }
+
+    let hash = stable_hash_suffix(input.as_bytes());
+    let prefix_limit = MAX_BUCKET_NAME_LEN.saturating_sub(hash.len() + 2);
+    encoded.truncate(prefix_limit);
+    while encoded.ends_with('_') {
+        encoded.pop();
+    }
+    if encoded.is_empty() {
+        encoded.push_str("path");
+    }
+    format!("{encoded}__{hash}")
 }
 
 fn hex(value: u8) -> char {
@@ -172,6 +187,18 @@ fn hex(value: u8) -> char {
         10..=15 => (b'A' + value - 10) as char,
         _ => unreachable!(),
     }
+}
+
+fn stable_hash_suffix(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016X}")
 }
 
 fn unix_millis() -> Result<u128> {
@@ -188,7 +215,10 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::{SnapshotStore, StoredSnapshot, compare_snapshot_order, encode_bucket_name};
+    use super::{
+        MAX_BUCKET_NAME_LEN, SnapshotStore, StoredSnapshot, compare_snapshot_order,
+        encode_bucket_name,
+    };
     use crate::gdu::SnapshotTree;
 
     #[test]
@@ -197,6 +227,15 @@ mod tests {
         assert!(!encoded.contains('/'));
         assert!(encoded.contains("_2F"));
         assert!(encoded.contains("_20"));
+    }
+
+    #[test]
+    fn long_bucket_name_is_shortened_with_hash() {
+        let long_path = format!("/{}", "very-long-segment/".repeat(40));
+        let encoded = encode_bucket_name(&long_path);
+        assert!(encoded.len() <= MAX_BUCKET_NAME_LEN);
+        assert!(encoded.contains("__"));
+        assert!(!encoded.contains('/'));
     }
 
     #[test]

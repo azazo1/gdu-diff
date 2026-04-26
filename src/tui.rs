@@ -25,6 +25,7 @@ pub struct App {
     current_path: String,
     rows: Vec<RowData>,
     table_state: TableState,
+    page_step: usize,
     should_quit: bool,
     status_message: Option<StatusMessage>,
 }
@@ -34,11 +35,12 @@ impl App {
         let mut app = Self {
             analysis,
             metric,
-            sort: SortMode::LatestSize,
+            sort: SortMode::Delta,
             include_files,
             current_path: String::new(),
             rows: Vec::new(),
             table_state: TableState::default(),
+            page_step: 1,
             should_quit: false,
             status_message: None,
         };
@@ -73,6 +75,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::PageUp | KeyCode::Char(',') => self.move_selection_page(-1),
+            KeyCode::PageDown | KeyCode::Char('.') => self.move_selection_page(1),
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter_selected()?,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent()?,
             KeyCode::Char('a') => {
@@ -82,7 +86,7 @@ impl App {
                 };
                 self.refresh_rows()?;
             }
-            KeyCode::Char('.') => {
+            KeyCode::Char('f') => {
                 self.include_files = !self.include_files;
                 self.refresh_rows()?;
             }
@@ -117,6 +121,11 @@ impl App {
         let current = self.table_state.selected().unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, self.rows.len() as isize - 1) as usize;
         self.table_state.select(Some(next));
+    }
+
+    fn move_selection_page(&mut self, direction: isize) {
+        let step = self.page_step.max(1) as isize;
+        self.move_selection(step * direction);
     }
 
     fn enter_selected(&mut self) -> Result<()> {
@@ -304,6 +313,7 @@ impl App {
             Constraint::Length(3),
         ])
         .split(area);
+        self.page_step = children_page_step(chunks[1]);
 
         let header = Paragraph::new(vec![
             Line::from(vec![
@@ -440,7 +450,7 @@ impl App {
         self.render_selected_panel(frame, chunks[2])?;
 
         let help = Paragraph::new(Line::from(
-            "j/k or arrows move  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  . files  c rel-path  C abs-path  q quit",
+            "j/k or arrows move  ,/. page  l/enter open  h/backspace up  s size-sort  d delta-sort  p share-sort  n name-sort  a metric  f files  c rel-path  C abs-path  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(help, chunks[3]);
@@ -737,12 +747,16 @@ fn children_empty_lines(include_files: bool) -> Vec<Line<'static>> {
 
     if !include_files {
         lines.push(Line::from(Span::styled(
-            "If it only contains files, press . to show them.",
+            "If it only contains files, press f to show them.",
             Style::default().fg(Color::Rgb(170, 170, 170)),
         )));
     }
 
     lines
+}
+
+fn children_page_step(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(3)).max(1)
 }
 
 fn styled_entry_name_spans(name: &str, kind: crate::analysis::EntryKind) -> Vec<Span<'static>> {
