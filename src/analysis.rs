@@ -175,6 +175,7 @@ impl Analysis {
         if snapshots.len() < 2 {
             bail!("please provide at least two gdu export files");
         }
+        ensure_matching_roots(&snapshots)?;
         snapshots.sort_by_key(|snapshot| snapshot.exported_at.unwrap_or(u64::MAX));
         let indices = snapshots
             .into_iter()
@@ -477,6 +478,27 @@ fn sort_rows(mut rows: Vec<RowData>, sort: SortMode) -> Vec<RowData> {
     rows
 }
 
+fn ensure_matching_roots(snapshots: &[SnapshotTree]) -> Result<()> {
+    let Some(first) = snapshots.first() else {
+        return Ok(());
+    };
+    let expected_root = first.root.name();
+
+    for snapshot in snapshots.iter().skip(1) {
+        if snapshot.root.name() != expected_root {
+            bail!(
+                "cannot compare snapshots with different roots: {} is {}, but {} is {}",
+                first.label,
+                expected_root,
+                snapshot.label,
+                snapshot.root.name()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
@@ -575,6 +597,31 @@ mod tests {
         assert_eq!(root.latest_size, 50);
         assert_eq!(root.delta, 30);
         assert_eq!(root.latest_root_share(), 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_snapshots_with_different_roots() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/first","mtime":1},{"name":"one.bin","asize":10,"dsize":20,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/second","mtime":1},{"name":"one.bin","asize":40,"dsize":50,"mtime":1}]]"#,
+        )?;
+
+        let error = match Analysis::new(vec![first, second]) {
+            Ok(_) => panic!("root mismatch should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot compare snapshots with different roots")
+        );
         Ok(())
     }
 }

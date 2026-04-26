@@ -43,6 +43,7 @@ enum CommandKind {
 enum Action {
     Shot { target: PathBuf },
     CompareFiles { files: Vec<PathBuf> },
+    CompareCurrentWithFile { file: PathBuf, target: PathBuf },
     DiffTarget { target: PathBuf },
 }
 
@@ -68,6 +69,17 @@ fn main() -> Result<()> {
                 .map(SnapshotTree::load)
                 .collect::<Result<Vec<_>>>()?;
             run_tui(snapshots, &cli)
+        }
+        Action::CompareCurrentWithFile { file, target } => {
+            let snapshot = SnapshotTree::load(file)?;
+            let canonical_target = canonicalize_dir(&target)?;
+
+            let temp_dir = tempdir().context("failed to create temporary directory")?;
+            let current_path = temp_dir.path().join("current.json");
+            export_snapshot(&canonical_target, &current_path)?;
+            let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
+
+            run_tui(vec![snapshot, current], &cli)
         }
         Action::DiffTarget { target } => {
             let canonical_target = canonicalize_dir(&target)?;
@@ -119,7 +131,7 @@ fn classify_action(cli: &Cli) -> Result<Action> {
         });
     }
 
-    if cli.args.len() >= 2 && cli.args.iter().all(|x| is_json_file_arg(x)) {
+    if cli.args.len() >= 2 && cli.args.iter().all(|x| is_json_like_path(x)) {
         return Ok(Action::CompareFiles {
             files: cli.args.clone(),
         });
@@ -128,28 +140,39 @@ fn classify_action(cli: &Cli) -> Result<Action> {
     if cli.args.len() == 1 {
         let target = cli.args[0].clone();
         if is_json_like_path(&target) {
-            bail!("a single JSON file is ambiguous, pass two JSON files or a directory path");
+            return Ok(Action::CompareCurrentWithFile {
+                file: target,
+                target: env::current_dir().context("failed to get current directory")?,
+            });
         }
         return Ok(Action::DiffTarget { target });
     }
 
+    if cli.args.len() == 2 {
+        let target = cli.args[0].clone();
+        let file = cli.args[1].clone();
+        if !is_json_like_path(&target) && is_json_like_path(&file) {
+            return Ok(Action::CompareCurrentWithFile { file, target });
+        }
+    }
+
     bail!(
-        "pass JSON files only when comparing snapshots directly; otherwise pass at most one directory path"
+        "use `gdu-diff [directory] snapshot.json` to compare a directory with one snapshot, or pass only JSON files when comparing snapshots directly"
     )
 }
 
-fn is_json_file_arg(path: &Path) -> bool {
-    is_json_like_path(path)
-}
-
 fn is_json_like_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
     use super::{Action, Cli, classify_action};
@@ -181,5 +204,26 @@ mod tests {
             classify_action(&cli).expect("classify"),
             Action::Shot { .. }
         ));
+    }
+
+    #[test]
+    fn detects_single_json_as_compare_current() {
+        let cli = Cli::parse_from(["gdu-diff", "base.json"]);
+        assert!(matches!(
+            classify_action(&cli).expect("classify"),
+            Action::CompareCurrentWithFile { .. }
+        ));
+    }
+
+    #[test]
+    fn detects_directory_and_json_as_compare_current() {
+        let cli = Cli::parse_from(["gdu-diff", "/tmp", "base.json"]);
+        match classify_action(&cli).expect("classify") {
+            Action::CompareCurrentWithFile { file, target } => {
+                assert_eq!(file, PathBuf::from("base.json"));
+                assert_eq!(target, PathBuf::from("/tmp"));
+            }
+            _ => panic!("expected compare current with file"),
+        }
     }
 }

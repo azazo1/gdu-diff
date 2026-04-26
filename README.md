@@ -5,7 +5,7 @@
 它支持两类主要工作流:
 
 - 保存某个目录的历史快照
-- 将历史快照和当前扫描结果, 或两份 JSON 快照, 放在一起对比
+- 将历史快照和当前扫描结果, 或一份 / 多份 JSON 快照, 放在一起对比
 
 ## 核心概念
 
@@ -84,6 +84,20 @@ gdu-diff /path/to/dir
 gdu-diff
 ```
 
+### 使用单个 JSON 对比目录
+
+如果只传入一份 `.json` 文件, 程序会重新扫描当前工作目录, 然后对比“这份快照 vs 当前目录”:
+
+```bash
+gdu-diff old.json
+```
+
+也可以显式指定要扫描的目录, 语法是 `gdu-diff [目录] snapshot.json`:
+
+```bash
+gdu-diff /path/to/dir old.json
+```
+
 ### 直接对比两份或多份 JSON
 
 如果传入两个或以上 `.json` 文件, 程序会直接加载这些快照并打开 TUI:
@@ -92,6 +106,8 @@ gdu-diff
 gdu-diff old.json new.json
 gdu-diff 2026-01.json 2026-02.json 2026-03.json
 ```
+
+无论是单个 JSON 对比目录, 还是直接对比多份 JSON, 所有快照的根目录都必须一致。根目录不同会直接报错, 不进入 TUI。
 
 ### 切换 apparent size
 
