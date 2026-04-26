@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,7 @@ pub struct App {
     include_files: bool,
     current_path: String,
     rows: Vec<RowData>,
+    marked_paths: BTreeSet<String>,
     table_state: TableState,
     page_step: usize,
     show_help: bool,
@@ -42,6 +44,7 @@ impl App {
             include_files,
             current_path: String::new(),
             rows: Vec::new(),
+            marked_paths: BTreeSet::new(),
             table_state: TableState::default(),
             page_step: 1,
             show_help: false,
@@ -91,7 +94,7 @@ impl App {
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {}
+            KeyCode::Esc => self.clear_marked_with_status(),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp | KeyCode::Char(',') => self.move_selection_page(-1),
@@ -101,6 +104,7 @@ impl App {
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter_selected()?,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.go_parent()?,
             KeyCode::Char('a') => {
+                self.clear_marked_silently();
                 self.metric = match self.metric {
                     SizeMetric::Disk => SizeMetric::Apparent,
                     SizeMetric::Apparent => SizeMetric::Disk,
@@ -108,6 +112,7 @@ impl App {
                 self.refresh_rows()?;
             }
             KeyCode::Char('f') => {
+                self.clear_marked_silently();
                 self.include_files = !self.include_files;
                 self.refresh_rows()?;
             }
@@ -127,6 +132,7 @@ impl App {
                 self.sort = SortMode::ShareDelta;
                 self.refresh_rows()?;
             }
+            KeyCode::Char(' ') => self.toggle_mark_selected(),
             KeyCode::Char('c') => self.copy_relative_path(),
             KeyCode::Char('C') => self.copy_absolute_path(),
             KeyCode::Char('b') => return Ok(AppAction::OpenShell(self.current_directory_path())),
@@ -175,6 +181,7 @@ impl App {
         else {
             return Ok(());
         };
+        self.clear_marked_silently();
         self.current_path = path;
         self.refresh_rows()
     }
@@ -184,6 +191,7 @@ impl App {
         let Some(parent) = Analysis::parent_path(&self.current_path) else {
             return Ok(());
         };
+        self.clear_marked_silently();
         self.current_path = parent;
         self.refresh_rows_with_selection(Some(child_path))
     }
@@ -242,6 +250,62 @@ impl App {
 
     fn set_status(&mut self, text: String, kind: StatusKind) {
         self.status_message = Some(StatusMessage { text, kind });
+    }
+
+    fn toggle_mark_selected(&mut self) {
+        let Some((path, name)) = self
+            .selected_row()
+            .map(|row| (row.path.clone(), row.name.clone()))
+        else {
+            return;
+        };
+
+        if self.marked_paths.insert(path.clone()) {
+            self.set_status(format!("Marked {name}"), StatusKind::Info);
+        } else {
+            self.marked_paths.remove(&path);
+            self.set_status(format!("Unmarked {name}"), StatusKind::Info);
+        }
+    }
+
+    fn clear_marked_silently(&mut self) {
+        self.marked_paths.clear();
+    }
+
+    fn clear_marked_with_status(&mut self) {
+        let count = self.marked_paths.len();
+        self.marked_paths.clear();
+        if count > 0 {
+            self.set_status(format!("Cleared {count} marked entries"), StatusKind::Info);
+        }
+    }
+
+    fn marked_summary(&self) -> Option<MarkedSummary> {
+        let mut summary = MarkedSummary::default();
+
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| self.marked_paths.contains(&row.path))
+        {
+            summary.count += 1;
+            summary.baseline_size += row.baseline_size;
+            summary.latest_size += row.latest_size;
+            summary.delta += row.delta;
+            summary.baseline_local_share += row.baseline_local_share;
+            summary.latest_local_share += row.latest_local_share;
+            summary.baseline_root_share += row.baseline_root_share();
+            summary.latest_root_share += row.latest_root_share();
+
+            match row.change_kind {
+                ChangeKind::Added => summary.added += 1,
+                ChangeKind::Removed => summary.removed += 1,
+                ChangeKind::Changed => summary.changed += 1,
+                ChangeKind::Unchanged => summary.unchanged += 1,
+            }
+        }
+
+        (summary.count > 0).then_some(summary)
     }
 
     fn selected_detail(&self) -> Result<SelectedDetail> {
@@ -415,6 +479,7 @@ impl App {
         frame.render_widget(header, chunks[0]);
 
         let header_row = Row::new(vec![
+            Cell::from("M"),
             Cell::from("Type"),
             Cell::from("Change"),
             Cell::from("Name"),
@@ -438,7 +503,18 @@ impl App {
             let rows = self.rows.iter().map(|row| {
                 let delta_style = delta_style(row.delta);
                 let share_style = share_style(row.local_share_delta);
+                let mark = if self.marked_paths.contains(&row.path) {
+                    Span::styled(
+                        "*",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw("")
+                };
                 Row::new(vec![
+                    Cell::from(mark),
                     Cell::from(row.kind.short()),
                     Cell::from(Span::styled(
                         row.change_kind.short(),
@@ -458,6 +534,7 @@ impl App {
             let table = Table::new(
                 rows,
                 [
+                    Constraint::Length(3),
                     Constraint::Length(6),
                     Constraint::Length(3),
                     Constraint::Min(24),
@@ -481,7 +558,7 @@ impl App {
         self.render_selected_panel(frame, chunks[2])?;
 
         let help = Paragraph::new(Line::from(
-            "j/k move  g/G ends  l open  h up  b shell  ? help  q quit",
+            "j/k move  space mark  g/G ends  l open  h up  ? help  q quit",
         ))
         .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(help, chunks[3]);
@@ -509,17 +586,23 @@ impl App {
             return Ok(());
         }
 
-        let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(inner);
-        let left = Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).split(columns[0]);
-        let right = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(columns[1]);
+        let columns = Layout::horizontal([
+            Constraint::Percentage(28),
+            Constraint::Percentage(32),
+            Constraint::Percentage(40),
+        ])
+        .split(inner);
+        let center =
+            Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).split(columns[1]);
+        let right = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(columns[2]);
 
-        self.render_selected_item_panel(frame, left[0], &detail);
+        self.render_marked_panel(frame, columns[0]);
+        self.render_selected_item_panel(frame, center[0], &detail);
 
         let size = Paragraph::new(detail.size_lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Size"));
-        frame.render_widget(size, left[1]);
+        frame.render_widget(size, center[1]);
 
         let share = Paragraph::new(detail.share_lines)
             .wrap(Wrap { trim: false })
@@ -620,15 +703,82 @@ impl App {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
+            Line::from("Space toggles the current row in the marked set"),
             Line::from("c copies relative path, C copies absolute path"),
             Line::from("b opens a shell in the current view directory"),
-            Line::from("q quits, Esc closes this help"),
+            Line::from("Esc clears marked rows, or closes this help"),
+            Line::from("Entering or leaving a directory also clears the marked set"),
+            Line::from("q quits"),
         ];
         let help = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Help"));
         frame.render_widget(Clear, area);
         frame.render_widget(help, area);
+    }
+
+    fn render_marked_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let block = Block::default().borders(Borders::ALL).title("Marked");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(summary) = self.marked_summary() else {
+            let lines = vec![
+                Line::from(Span::styled(
+                    "No marked entries.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "Press Space to mark the current row.",
+                    Style::default().fg(Color::Rgb(170, 170, 170)),
+                )),
+            ];
+            let panel = Paragraph::new(lines).wrap(Wrap { trim: false });
+            frame.render_widget(panel, inner);
+            return;
+        };
+
+        let panel = Paragraph::new(vec![
+            stat_line(
+                "Items",
+                summary.count.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            marked_counts_line(&summary),
+            stat_line(
+                "Baseline",
+                format_size(summary.baseline_size),
+                Style::default().fg(Color::DarkGray),
+            ),
+            stat_line(
+                "Latest",
+                format_size(summary.latest_size),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            stat_line(
+                "Delta",
+                format_signed_size(summary.delta),
+                delta_style(summary.delta).add_modifier(Modifier::BOLD),
+            ),
+            share_line(
+                "Parent",
+                summary.baseline_local_share,
+                summary.latest_local_share,
+                summary.latest_local_share - summary.baseline_local_share,
+            ),
+            share_line(
+                "Root",
+                summary.baseline_root_share,
+                summary.latest_root_share,
+                summary.latest_root_share - summary.baseline_root_share,
+            ),
+        ])
+        .wrap(Wrap { trim: false });
+        frame.render_widget(panel, inner);
     }
 }
 
@@ -816,6 +966,22 @@ struct SelectedDetail {
     timeline_lines: Vec<Line<'static>>,
 }
 
+#[derive(Default)]
+struct MarkedSummary {
+    count: usize,
+    added: usize,
+    removed: usize,
+    changed: usize,
+    unchanged: usize,
+    baseline_size: u64,
+    latest_size: u64,
+    delta: i64,
+    baseline_local_share: f64,
+    latest_local_share: f64,
+    baseline_root_share: f64,
+    latest_root_share: f64,
+}
+
 enum AppAction {
     None,
     OpenShell(PathBuf),
@@ -933,6 +1099,35 @@ fn share_line(label: &str, baseline: f64, latest: f64, delta: f64) -> Line<'stat
         Span::styled(
             format_share_delta(delta),
             share_style(delta).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn marked_counts_line(summary: &MarkedSummary) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "{:<DETAIL_LABEL_WIDTH$}",
+                "Counts",
+                DETAIL_LABEL_WIDTH = DETAIL_LABEL_WIDTH as usize
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("+{}  ", summary.added),
+            change_kind_style(ChangeKind::Added).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("-{}  ", summary.removed),
+            change_kind_style(ChangeKind::Removed).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("~{}  ", summary.changed),
+            change_kind_style(ChangeKind::Changed).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("={}", summary.unchanged),
+            change_kind_style(ChangeKind::Unchanged).add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -1188,11 +1383,12 @@ mod tests {
     use std::path::PathBuf;
 
     use anyhow::Result;
+    use crossterm::event::KeyCode;
 
     use crate::analysis::{Analysis, SizeMetric, SortMode};
     use crate::gdu::SnapshotTree;
 
-    use super::App;
+    use super::{App, AppAction};
 
     #[test]
     fn go_parent_reselects_the_directory_we_came_from() -> Result<()> {
@@ -1223,6 +1419,91 @@ mod tests {
 
         assert_eq!(app.current_path, "");
         assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("a"));
+        Ok(())
+    }
+
+    #[test]
+    fn space_marks_and_escape_clears_selection() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a.bin","asize":10,"dsize":10,"mtime":1},{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a.bin","asize":20,"dsize":20,"mtime":1},{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let mut app = App::new(analysis, SizeMetric::Disk, true)?;
+
+        assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
+        assert_eq!(app.marked_paths.len(), 1);
+
+        assert!(matches!(app.on_key(KeyCode::Esc)?, AppAction::None));
+        assert!(app.marked_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn entering_directory_clears_marked_selection() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":10,"dsize":10,"mtime":1}],{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":20,"dsize":20,"mtime":1}],{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let mut app = App::new(analysis, SizeMetric::Disk, true)?;
+        app.sort = SortMode::Name;
+        app.refresh_rows()?;
+        let selected_index = app
+            .rows
+            .iter()
+            .position(|row| row.path == "a")
+            .expect("directory a should exist");
+        app.table_state.select(Some(selected_index));
+
+        let _ = app.on_key(KeyCode::Char(' '))?;
+        assert_eq!(app.marked_paths.len(), 1);
+
+        let _ = app.on_key(KeyCode::Enter)?;
+        assert!(app.marked_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn changing_sort_keeps_marked_selection() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"b.bin","asize":10,"dsize":10,"mtime":1},{"name":"a.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"b.bin","asize":20,"dsize":20,"mtime":1},{"name":"a.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let mut app = App::new(analysis, SizeMetric::Disk, true)?;
+
+        app.table_state.select(Some(0));
+        let _ = app.on_key(KeyCode::Char(' '))?;
+        app.table_state.select(Some(1));
+        let _ = app.on_key(KeyCode::Char(' '))?;
+        assert_eq!(app.marked_paths.len(), 2);
+
+        let _ = app.on_key(KeyCode::Char('n'))?;
+        assert_eq!(app.marked_paths.len(), 2);
+        assert_eq!(app.marked_summary().map(|summary| summary.count), Some(2));
+
         Ok(())
     }
 }
