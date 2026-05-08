@@ -21,27 +21,10 @@ pub struct SnapshotTree {
     pub root: GduNode,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct SnapshotLoadProgress {
-    pub read_bytes: u64,
-    pub total_bytes: Option<u64>,
-    pub compressed: bool,
-}
-
-impl SnapshotLoadProgress {
-    pub fn ratio(&self) -> Option<f64> {
-        let total = self.total_bytes?;
-        if total == 0 {
-            return Some(1.0);
-        }
-        Some((self.read_bytes as f64 / total as f64).clamp(0.0, 1.0))
-    }
-}
-
 impl SnapshotTree {
     pub async fn load_with_progress<F>(path: PathBuf, on_progress: F) -> Result<Self>
     where
-        F: FnMut(SnapshotLoadProgress) + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
         let label = path
             .file_name()
@@ -52,18 +35,18 @@ impl SnapshotTree {
     }
 
     pub async fn load_with_label(path: PathBuf, label: String) -> Result<Self> {
-        Self::load_with_progress_and_label(path, label, |_| {}).await
+        Self::load_with_progress_and_label(path, label, || {}).await
     }
 
     pub async fn load_with_progress_and_label<F>(
         path: PathBuf,
         label: String,
-        on_progress: F,
+        _on_progress: F,
     ) -> Result<Self>
     where
-        F: FnMut(SnapshotLoadProgress) + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
-        tokio::task::spawn_blocking(move || load_snapshot_tree(label, path, on_progress))
+        tokio::task::spawn_blocking(move || load_snapshot_tree(label, path))
             .await
             .context("background snapshot loader task panicked")?
     }
@@ -98,29 +81,17 @@ impl SnapshotTree {
     }
 }
 
-fn load_snapshot_tree<F>(label: String, path: PathBuf, mut on_progress: F) -> Result<SnapshotTree>
-where
-    F: FnMut(SnapshotLoadProgress),
-{
-    let metadata = std::fs::metadata(&path)
-        .with_context(|| format!("failed to stat gdu export file {}", path.display()))?;
+fn load_snapshot_tree(label: String, path: PathBuf) -> Result<SnapshotTree> {
     let compressed = is_zstd_snapshot_path(&path);
-    let total_bytes = Some(metadata.len());
     let file =
         File::open(&path).with_context(|| format!("failed to read gdu export file {}", path.display()))?;
-    let reader = ProgressReader::new(file, total_bytes, compressed, &mut on_progress);
     let content = if compressed {
-        let decoder = zstd::stream::Decoder::new(reader)
+        let decoder = zstd::stream::Decoder::new(file)
             .with_context(|| format!("failed to initialize zstd decoder for {}", path.display()))?;
         read_utf8(decoder, &path)?
     } else {
-        read_utf8(reader, &path)?
+        read_utf8(file, &path)?
     };
-    on_progress(SnapshotLoadProgress {
-        read_bytes: metadata.len(),
-        total_bytes,
-        compressed,
-    });
     SnapshotTree::from_json_str(label, path, &content)
 }
 
@@ -131,51 +102,6 @@ fn read_utf8(reader: impl Read, path: &Path) -> Result<String> {
         .read_to_string(&mut content)
         .with_context(|| format!("failed to read gdu export file {}", path.display()))?;
     Ok(content)
-}
-
-struct ProgressReader<'a, R> {
-    inner: R,
-    read_bytes: u64,
-    total_bytes: Option<u64>,
-    compressed: bool,
-    on_progress: &'a mut dyn FnMut(SnapshotLoadProgress),
-}
-
-impl<'a, R> ProgressReader<'a, R> {
-    fn new(
-        inner: R,
-        total_bytes: Option<u64>,
-        compressed: bool,
-        on_progress: &'a mut dyn FnMut(SnapshotLoadProgress),
-    ) -> Self {
-        Self {
-            inner,
-            read_bytes: 0,
-            total_bytes,
-            compressed,
-            on_progress,
-        }
-    }
-
-    fn emit_progress(&mut self) {
-        (self.on_progress)(SnapshotLoadProgress {
-            read_bytes: self.read_bytes,
-            total_bytes: self.total_bytes,
-            compressed: self.compressed,
-        });
-    }
-}
-
-impl<R> Read for ProgressReader<'_, R>
-where
-    R: Read,
-{
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        self.read_bytes = self.read_bytes.saturating_add(read as u64);
-        self.emit_progress();
-        Ok(read)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -466,7 +392,7 @@ mod tests {
         )?;
         compress_snapshot_file_blocking(&raw_path, &compressed_path)?;
 
-        let snapshot = SnapshotTree::load_with_progress(compressed_path, |_| {}).await?;
+        let snapshot = SnapshotTree::load_with_progress(compressed_path, || {}).await?;
         assert_eq!(snapshot.label, "sample");
         assert_eq!(snapshot.exported_at, Some(42));
         Ok(())
