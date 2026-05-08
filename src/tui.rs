@@ -1053,6 +1053,8 @@ fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    // Reset ratatui's diff state because the shell session replaced the screen contents.
+    terminal.clear()?;
     terminal.hide_cursor()?;
     Ok(())
 }
