@@ -88,9 +88,11 @@ impl SnapshotStore {
             return Ok(None);
         }
 
-        let mut snapshots = self.load_snapshots_in_bucket(&bucket)?;
-        snapshots.sort_by(|left, right| compare_snapshot_order(right, left));
-        Ok(snapshots.into_iter().nth(ordinal_from_newest - 1))
+        let paths = self.list_ordered_snapshot_paths_in_bucket(&bucket)?;
+        let Some(path) = paths.into_iter().nth(ordinal_from_newest - 1) else {
+            return Ok(None);
+        };
+        Ok(Some(self.load_snapshot(path)?))
     }
 
     fn bucket_dir_for(&self, canonical_target: &Path) -> PathBuf {
@@ -121,26 +123,20 @@ impl SnapshotStore {
     }
 
     fn prune_bucket(&self, bucket: &Path) -> Result<()> {
-        let mut snapshots = self.load_snapshots_in_bucket(bucket)?;
-        if snapshots.len() <= MAX_SHOTS_PER_BUCKET {
+        let paths = self.list_ordered_snapshot_paths_in_bucket(bucket)?;
+        if paths.len() <= MAX_SHOTS_PER_BUCKET {
             return Ok(());
         }
 
-        snapshots.sort_by(compare_snapshot_order);
-        let remove_count = snapshots.len() - MAX_SHOTS_PER_BUCKET;
-        for snapshot in snapshots.into_iter().take(remove_count) {
-            fs::remove_file(&snapshot.source).with_context(|| {
-                format!(
-                    "failed to remove old snapshot {}",
-                    snapshot.source.display()
-                )
-            })?;
+        for path in paths.into_iter().skip(MAX_SHOTS_PER_BUCKET) {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove old snapshot {}", path.display()))?;
         }
         Ok(())
     }
 
-    fn load_snapshots_in_bucket(&self, bucket: &Path) -> Result<Vec<StoredSnapshot>> {
-        let mut snapshots = Vec::new();
+    fn list_ordered_snapshot_paths_in_bucket(&self, bucket: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(bucket)
             .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?
         {
@@ -149,18 +145,22 @@ impl SnapshotStore {
             if path.extension().and_then(OsStr::to_str) != Some("json") {
                 continue;
             }
-
-            let label = path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .map_or_else(|| String::from("snapshot"), str::to_owned);
-            let snapshot = SnapshotTree::load_with_label(path.clone(), label)?;
-            snapshots.push(StoredSnapshot {
-                source: path,
-                snapshot,
-            });
+            paths.push(path);
         }
-        Ok(snapshots)
+        paths.sort_by(|left, right| compare_snapshot_path_order(left, right));
+        Ok(paths)
+    }
+
+    fn load_snapshot(&self, path: PathBuf) -> Result<StoredSnapshot> {
+        let label = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .map_or_else(|| String::from("snapshot"), str::to_owned);
+        let snapshot = SnapshotTree::load_with_label(path.clone(), label)?;
+        Ok(StoredSnapshot {
+            source: path,
+            snapshot,
+        })
     }
 }
 
@@ -173,11 +173,23 @@ pub fn canonicalize_dir(target: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn compare_snapshot_order(left: &StoredSnapshot, right: &StoredSnapshot) -> std::cmp::Ordering {
-    left.snapshot
-        .exported_at
-        .cmp(&right.snapshot.exported_at)
-        .then_with(|| left.source.cmp(&right.source))
+fn compare_snapshot_path_order(left: &Path, right: &Path) -> std::cmp::Ordering {
+    match (snapshot_name_sort_key(left), snapshot_name_sort_key(right)) {
+        (Some(left_key), Some(right_key)) => right_key.cmp(&left_key).then_with(|| right.cmp(left)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => right.cmp(left),
+    }
+}
+
+fn snapshot_name_sort_key(path: &Path) -> Option<(u64, u32)> {
+    let stem = path.file_stem()?.to_str()?;
+    let suffix = stem.strip_prefix("shot-")?;
+    let (timestamp, ordinal) = match suffix.split_once('-') {
+        Some((timestamp, ordinal)) => (timestamp, ordinal.parse().ok()?),
+        None => (suffix, 0),
+    };
+    Some((timestamp.parse().ok()?, ordinal))
 }
 
 fn encode_bucket_name(input: &str) -> String {
@@ -240,17 +252,17 @@ fn unix_millis() -> Result<u128> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
+    use std::path::Path;
 
     use anyhow::Result;
     use tempfile::tempdir;
 
     use super::{
-        MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, StoredSnapshot,
-        canonicalize_dir,
-        compare_snapshot_order, encode_bucket_name,
+        MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, canonicalize_dir,
+        compare_snapshot_path_order, encode_bucket_name,
     };
-    use crate::gdu::SnapshotTree;
 
     #[test]
     fn bucket_name_is_filesystem_safe() {
@@ -270,30 +282,13 @@ mod tests {
     }
 
     #[test]
-    fn prefers_newer_exported_at() -> Result<()> {
-        let dir = tempdir()?;
-        let older_path = dir.path().join("shot-10.json");
-        let newer_path = dir.path().join("shot-20.json");
-        fs::write(
-            &older_path,
-            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a","asize":1,"dsize":1,"mtime":1}]]"#,
-        )?;
-        fs::write(
-            &newer_path,
-            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a","asize":1,"dsize":1,"mtime":1}]]"#,
-        )?;
+    fn prefers_newer_snapshot_names() {
+        let older = Path::new("/tmp/shot-10.json");
+        let newer = Path::new("/tmp/shot-20.json");
+        let duplicate = Path::new("/tmp/shot-20-1.json");
 
-        let older = StoredSnapshot {
-            source: older_path.clone(),
-            snapshot: SnapshotTree::load_with_label(older_path, String::from("older"))?,
-        };
-        let newer = StoredSnapshot {
-            source: newer_path.clone(),
-            snapshot: SnapshotTree::load_with_label(newer_path, String::from("newer"))?,
-        };
-
-        assert!(compare_snapshot_order(&newer, &older).is_gt());
-        Ok(())
+        assert!(compare_snapshot_path_order(newer, older).is_lt());
+        assert!(compare_snapshot_path_order(duplicate, newer).is_lt());
     }
 
     #[test]
@@ -340,6 +335,35 @@ mod tests {
     }
 
     #[test]
+    fn find_nth_latest_for_only_loads_selected_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let snapshots_dir = dir.path().join("snapshots");
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target)?;
+        let canonical_target = canonicalize_dir(&target)?;
+        let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
+        fs::create_dir_all(&bucket)?;
+
+        fs::write(bucket.join("shot-10.json"), "{not valid json")?;
+        fs::write(
+            bucket.join("shot-20.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a","asize":1,"dsize":1,"mtime":1}]]"#,
+        )?;
+
+        let store = SnapshotStore {
+            data_dir: dir.path().to_path_buf(),
+            snapshots_dir,
+        };
+        let newest = store
+            .find_nth_latest_for(&canonical_target, 1)?
+            .expect("newest snapshot");
+
+        assert_eq!(newest.source.file_name().and_then(OsStr::to_str), Some("shot-20.json"));
+        assert_eq!(newest.snapshot.exported_at, Some(20));
+        Ok(())
+    }
+
+    #[test]
     fn prune_bucket_keeps_only_latest_three_shots() -> Result<()> {
         let dir = tempdir()?;
         let snapshots_dir = dir.path().join("snapshots");
@@ -363,9 +387,14 @@ mod tests {
         store.prune_bucket(&bucket)?;
 
         let mut remaining = store
-            .load_snapshots_in_bucket(&bucket)?
+            .list_ordered_snapshot_paths_in_bucket(&bucket)?
             .into_iter()
-            .map(|snapshot| snapshot.snapshot.exported_at.unwrap_or_default())
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(OsStr::to_str)
+                    .and_then(|stem| stem.strip_prefix("shot-"))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
             .collect::<Vec<_>>();
         remaining.sort_unstable();
 
