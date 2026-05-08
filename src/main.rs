@@ -86,7 +86,11 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
         Action::Shot { .. } => unreachable!(),
     };
 
-    loading.set_step(total_steps.saturating_sub(1), String::from("Build analysis"), "Indexing snapshot trees");
+    loading.set_step(
+        total_steps.saturating_sub(1),
+        String::from("Build analysis"),
+        "Indexing snapshot trees",
+    );
     session.draw_loading(&loading)?;
 
     let analysis = Analysis::new_with_progress(snapshots, |progress| {
@@ -107,7 +111,11 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
         SizeMetric::Disk
     };
 
-    loading.set_step(total_steps, String::from("Prepare interface"), "Building initial table view");
+    loading.set_step(
+        total_steps,
+        String::from("Prepare interface"),
+        "Building initial table view",
+    );
     session.draw_loading(&loading)?;
 
     let mut app = App::new(analysis, metric, !cli.dirs_only)?;
@@ -119,14 +127,23 @@ fn load_compare_files(
     session: &mut TerminalSession,
     loading: &mut LoadingState,
 ) -> Result<Vec<SnapshotTree>> {
-    loading.set_step(1, String::from("Load snapshots"), format!("Reading {} snapshot files", files.len()));
+    loading.set_step(
+        1,
+        String::from("Load snapshots"),
+        format!("Reading {} snapshot files", files.len()),
+    );
     session.draw_loading(loading)?;
 
     let total = files.len();
     let mut snapshots = Vec::with_capacity(total);
     for (index, path) in files.into_iter().enumerate() {
         loading.set_step_progress((index as f64) / total.max(1) as f64);
-        loading.set_detail(format!("Reading snapshot {}/{}: {}", index + 1, total, path.display()));
+        loading.set_detail(format!(
+            "Reading snapshot {}/{}: {}",
+            index + 1,
+            total,
+            path.display()
+        ));
         session.draw_loading(loading)?;
         snapshots.push(SnapshotTree::load(path)?);
     }
@@ -140,17 +157,29 @@ fn load_compare_current_with_file(
     session: &mut TerminalSession,
     loading: &mut LoadingState,
 ) -> Result<Vec<SnapshotTree>> {
-    loading.set_step(1, String::from("Load baseline snapshot"), format!("Reading {}", file.display()));
+    loading.set_step(
+        1,
+        String::from("Load baseline snapshot"),
+        format!("Reading {}", file.display()),
+    );
     session.draw_loading(loading)?;
     let snapshot = SnapshotTree::load(file)?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(2, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
+    loading.set_step(
+        2,
+        String::from("Resolve target directory"),
+        format!("Resolving {}", target.display()),
+    );
     session.draw_loading(loading)?;
     let canonical_target = canonicalize_dir(&target)?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
+    loading.set_step(
+        3,
+        String::from("Scan current directory"),
+        format!("Launching gdu-go for {}", canonical_target.display()),
+    );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
     let current_path = temp_dir.path().join("current.json");
@@ -160,7 +189,11 @@ fn load_compare_current_with_file(
     })?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
+    loading.set_step(
+        4,
+        String::from("Load current snapshot"),
+        String::from("Parsing generated JSON"),
+    );
     session.draw_loading(loading)?;
     let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
     loading.set_step_progress(1.0);
@@ -173,12 +206,20 @@ fn load_diff_target(
     session: &mut TerminalSession,
     loading: &mut LoadingState,
 ) -> Result<Vec<SnapshotTree>> {
-    loading.set_step(1, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
+    loading.set_step(
+        1,
+        String::from("Resolve target directory"),
+        format!("Resolving {}", target.display()),
+    );
     session.draw_loading(loading)?;
     let canonical_target = canonicalize_dir(&target)?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(2, String::from("Find latest stored snapshot"), canonical_target.display().to_string());
+    loading.set_step(
+        2,
+        String::from("Find latest stored snapshot"),
+        canonical_target.display().to_string(),
+    );
     session.draw_loading(loading)?;
     let store = SnapshotStore::new()?;
     let latest = store.find_latest_for(&canonical_target)?.with_context(|| {
@@ -191,7 +232,11 @@ fn load_diff_target(
     })?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
+    loading.set_step(
+        3,
+        String::from("Scan current directory"),
+        format!("Launching gdu-go for {}", canonical_target.display()),
+    );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
     let current_path = temp_dir.path().join("current.json");
@@ -201,7 +246,11 @@ fn load_diff_target(
     })?;
     loading.set_step_progress(1.0);
 
-    loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
+    loading.set_step(
+        4,
+        String::from("Load current snapshot"),
+        String::from("Parsing generated JSON"),
+    );
     session.draw_loading(loading)?;
     let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
     loading.set_step_progress(1.0);
@@ -319,10 +368,10 @@ fn resolve_snapshot_reference(path: &Path, target: &Path) -> Result<PathBuf> {
 
     let canonical_target = canonicalize_dir(target)?;
     let store = SnapshotStore::new()?;
-    let snapshot = store
-        .find_nth_latest_for(&canonical_target, ordinal)?
+    let snapshot_path = store
+        .find_nth_latest_path_for(&canonical_target, ordinal)?
         .with_context(|| missing_shot_message(&store, &canonical_target, ordinal))?;
-    Ok(snapshot.source)
+    Ok(snapshot_path)
 }
 
 fn missing_shot_message(store: &SnapshotStore, target: &Path, ordinal: usize) -> String {

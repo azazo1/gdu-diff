@@ -73,11 +73,11 @@ impl SnapshotStore {
         self.find_nth_latest_for(target, 1)
     }
 
-    pub fn find_nth_latest_for(
+    pub fn find_nth_latest_path_for(
         &self,
         target: &Path,
         ordinal_from_newest: usize,
-    ) -> Result<Option<StoredSnapshot>> {
+    ) -> Result<Option<PathBuf>> {
         if ordinal_from_newest == 0 {
             bail!("shot index must start at 1");
         }
@@ -89,7 +89,15 @@ impl SnapshotStore {
         }
 
         let paths = self.list_ordered_snapshot_paths_in_bucket(&bucket)?;
-        let Some(path) = paths.into_iter().nth(ordinal_from_newest - 1) else {
+        Ok(paths.into_iter().nth(ordinal_from_newest - 1))
+    }
+
+    pub fn find_nth_latest_for(
+        &self,
+        target: &Path,
+        ordinal_from_newest: usize,
+    ) -> Result<Option<StoredSnapshot>> {
+        let Some(path) = self.find_nth_latest_path_for(target, ordinal_from_newest)? else {
             return Ok(None);
         };
         Ok(Some(self.load_snapshot(path)?))
@@ -358,8 +366,36 @@ mod tests {
             .find_nth_latest_for(&canonical_target, 1)?
             .expect("newest snapshot");
 
-        assert_eq!(newest.source.file_name().and_then(OsStr::to_str), Some("shot-20.json"));
+        assert_eq!(
+            newest.source.file_name().and_then(OsStr::to_str),
+            Some("shot-20.json")
+        );
         assert_eq!(newest.snapshot.exported_at, Some(20));
+        Ok(())
+    }
+
+    #[test]
+    fn find_nth_latest_path_for_returns_path_without_parsing_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let snapshots_dir = dir.path().join("snapshots");
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target)?;
+        let canonical_target = canonicalize_dir(&target)?;
+        let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
+        fs::create_dir_all(&bucket)?;
+
+        let snapshot_path = bucket.join("shot-10.json");
+        fs::write(&snapshot_path, "not-json")?;
+
+        let store = SnapshotStore {
+            data_dir: dir.path().to_path_buf(),
+            snapshots_dir,
+        };
+        let resolved = store
+            .find_nth_latest_path_for(&canonical_target, 1)?
+            .expect("snapshot path");
+
+        assert_eq!(resolved, snapshot_path);
         Ok(())
     }
 

@@ -192,7 +192,10 @@ impl Analysis {
         Self::new_with_progress(snapshots, |_| {})
     }
 
-    pub fn new_with_progress<F>(mut snapshots: Vec<SnapshotTree>, mut on_progress: F) -> Result<Self>
+    pub fn new_with_progress<F>(
+        mut snapshots: Vec<SnapshotTree>,
+        mut on_progress: F,
+    ) -> Result<Self>
     where
         F: FnMut(IndexProgress<'_>),
     {
@@ -206,15 +209,18 @@ impl Analysis {
         for (index, snapshot) in snapshots.into_iter().enumerate() {
             let label = snapshot.label.clone();
             let progress_index = index + 1;
-            indices.push(SnapshotIndex::from_snapshot(snapshot, |snapshot_progress, current_path| {
-                on_progress(IndexProgress {
-                    snapshot_index: progress_index,
-                    snapshot_total: total,
-                    snapshot_label: &label,
-                    snapshot_progress,
-                    current_path,
-                });
-            })?);
+            indices.push(SnapshotIndex::from_snapshot(
+                snapshot,
+                |snapshot_progress, current_path| {
+                    on_progress(IndexProgress {
+                        snapshot_index: progress_index,
+                        snapshot_total: total,
+                        snapshot_label: &label,
+                        snapshot_progress,
+                        current_path,
+                    });
+                },
+            )?);
         }
         Ok(Self { snapshots: indices })
     }
@@ -809,7 +815,11 @@ mod tests {
 
         assert_eq!(analysis.snapshot_count(), 2);
         assert!(!overall_progress.is_empty());
-        assert!(overall_progress.windows(2).all(|window| window[0] <= window[1]));
+        assert!(
+            overall_progress
+                .windows(2)
+                .all(|window| window[0] <= window[1])
+        );
         assert_eq!(overall_progress.last().copied(), Some(1.0));
         assert_eq!(
             per_snapshot_progress
@@ -848,7 +858,11 @@ mod tests {
             overall_progress.push(progress.overall_progress());
         })?;
 
-        assert!(overall_progress.windows(2).all(|window| window[0] <= window[1]));
+        assert!(
+            overall_progress
+                .windows(2)
+                .all(|window| window[0] <= window[1])
+        );
         assert_eq!(overall_progress.last().copied(), Some(1.0));
         Ok(())
     }

@@ -124,7 +124,11 @@ pub fn export_snapshot(target: &Path, output: &Path) -> Result<()> {
     export_snapshot_with_progress(target, output, |_| {})
 }
 
-pub fn export_snapshot_with_progress<F>(target: &Path, output: &Path, mut on_progress: F) -> Result<()>
+pub fn export_snapshot_with_progress<F>(
+    target: &Path,
+    output: &Path,
+    mut on_progress: F,
+) -> Result<()>
 where
     F: FnMut(&str),
 {
@@ -158,7 +162,11 @@ where
                 }
 
                 let result = child.wait_with_output().with_context(|| {
-                    format!("failed to wait for {} while exporting {}", candidate, target.display())
+                    format!(
+                        "failed to wait for {} while exporting {}",
+                        candidate,
+                        target.display()
+                    )
                 })?;
                 if result.status.success() {
                     return Ok(());

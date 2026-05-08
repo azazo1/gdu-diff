@@ -16,7 +16,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
+};
 
 use crate::analysis::{Analysis, ChangeKind, RowData, SizeMetric, SortMode};
 
@@ -1047,7 +1049,11 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("step {}/{}", loading.current_step.max(1), loading.total_steps),
+            format!(
+                "step {}/{}",
+                loading.current_step.max(1),
+                loading.total_steps
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
