@@ -1,10 +1,10 @@
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dirs_next::data_dir;
+use tokio::fs;
 
 use crate::gdu::{SnapshotTree, export_snapshot};
 
@@ -38,28 +38,32 @@ impl SnapshotStore {
         &self.data_dir
     }
 
-    pub fn save_shot(&self, target: &Path) -> Result<StoredSnapshot> {
-        let canonical_target = canonicalize_dir(target)?;
+    pub async fn save_shot(&self, target: &Path) -> Result<StoredSnapshot> {
+        let canonical_target = canonicalize_dir(target).await?;
         let bucket = self.bucket_dir_for(&canonical_target);
         fs::create_dir_all(&bucket)
+            .await
             .with_context(|| format!("failed to create snapshot directory {}", bucket.display()))?;
 
         let temp_path = bucket.join(format!("pending-{}.json", unix_millis()?));
-        export_snapshot(&canonical_target, &temp_path)?;
-        let snapshot = SnapshotTree::load_with_label(temp_path.clone(), String::from("latest"))?;
-        let final_path = self.unique_snapshot_path(&bucket, snapshot.exported_at)?;
-        fs::rename(&temp_path, &final_path).with_context(|| {
+        export_snapshot(&canonical_target, &temp_path).await?;
+        let snapshot =
+            SnapshotTree::load_with_label(temp_path.clone(), String::from("latest")).await?;
+        let final_path = self
+            .unique_snapshot_path(&bucket, snapshot.exported_at)
+            .await?;
+        fs::rename(&temp_path, &final_path).await.with_context(|| {
             format!(
                 "failed to move snapshot {} to {}",
                 temp_path.display(),
                 final_path.display()
             )
         })?;
-        self.prune_bucket(&bucket)?;
+        self.prune_bucket(&bucket).await?;
         Ok(StoredSnapshot { source: final_path })
     }
 
-    pub fn find_nth_latest_path_for(
+    pub async fn find_nth_latest_path_for(
         &self,
         target: &Path,
         ordinal_from_newest: usize,
@@ -68,13 +72,20 @@ impl SnapshotStore {
             bail!("shot index must start at 1");
         }
 
-        let canonical_target = canonicalize_dir(target)?;
+        let canonical_target = canonicalize_dir(target).await?;
         let bucket = self.bucket_dir_for(&canonical_target);
-        if !bucket.is_dir() {
-            return Ok(None);
+        match fs::metadata(&bucket).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read snapshot directory {}", bucket.display())
+                });
+            }
         }
 
-        let paths = self.list_ordered_snapshot_paths_in_bucket(&bucket)?;
+        let paths = self.list_ordered_snapshot_paths_in_bucket(&bucket).await?;
         Ok(paths.into_iter().nth(ordinal_from_newest - 1))
     }
 
@@ -83,18 +94,22 @@ impl SnapshotStore {
             .join(encode_bucket_name(&canonical_target.to_string_lossy()))
     }
 
-    fn unique_snapshot_path(&self, bucket: &Path, exported_at: Option<u64>) -> Result<PathBuf> {
+    async fn unique_snapshot_path(
+        &self,
+        bucket: &Path,
+        exported_at: Option<u64>,
+    ) -> Result<PathBuf> {
         let stem = exported_at
             .map(|value| format!("shot-{value}"))
             .unwrap_or_else(|| format!("shot-{}", unix_millis().unwrap_or_default()));
         let primary = bucket.join(format!("{stem}.json"));
-        if !primary.exists() {
+        if !path_exists(&primary).await? {
             return Ok(primary);
         }
 
         for index in 1..1000 {
             let candidate = bucket.join(format!("{stem}-{index}.json"));
-            if !candidate.exists() {
+            if !path_exists(&candidate).await? {
                 return Ok(candidate);
             }
         }
@@ -105,25 +120,26 @@ impl SnapshotStore {
         )
     }
 
-    fn prune_bucket(&self, bucket: &Path) -> Result<()> {
-        let paths = self.list_ordered_snapshot_paths_in_bucket(bucket)?;
+    async fn prune_bucket(&self, bucket: &Path) -> Result<()> {
+        let paths = self.list_ordered_snapshot_paths_in_bucket(bucket).await?;
         if paths.len() <= MAX_SHOTS_PER_BUCKET {
             return Ok(());
         }
 
         for path in paths.into_iter().skip(MAX_SHOTS_PER_BUCKET) {
             fs::remove_file(&path)
+                .await
                 .with_context(|| format!("failed to remove old snapshot {}", path.display()))?;
         }
         Ok(())
     }
 
-    fn list_ordered_snapshot_paths_in_bucket(&self, bucket: &Path) -> Result<Vec<PathBuf>> {
+    async fn list_ordered_snapshot_paths_in_bucket(&self, bucket: &Path) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
-        for entry in fs::read_dir(bucket)
-            .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?
-        {
-            let entry = entry?;
+        let mut entries = fs::read_dir(bucket)
+            .await
+            .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(OsStr::to_str) != Some("json") {
                 continue;
@@ -135,10 +151,14 @@ impl SnapshotStore {
     }
 }
 
-pub fn canonicalize_dir(target: &Path) -> Result<PathBuf> {
+pub async fn canonicalize_dir(target: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(target)
+        .await
         .with_context(|| format!("failed to resolve path {}", target.display()))?;
-    if !canonical.is_dir() {
+    let metadata = fs::metadata(&canonical)
+        .await
+        .with_context(|| format!("failed to stat {}", canonical.display()))?;
+    if !metadata.is_dir() {
         bail!("{} is not a directory", canonical.display());
     }
     Ok(canonical)
@@ -214,6 +234,14 @@ fn stable_hash_suffix(bytes: &[u8]) -> String {
     format!("{hash:016X}")
 }
 
+async fn path_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
 fn unix_millis() -> Result<u128> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -271,13 +299,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn find_nth_latest_for_returns_shots_from_newest_to_oldest() -> Result<()> {
+    #[tokio::test]
+    async fn find_nth_latest_for_returns_shots_from_newest_to_oldest() -> Result<()> {
         let dir = tempdir()?;
         let snapshots_dir = dir.path().join("snapshots");
         let target = dir.path().join("target");
         fs::create_dir_all(&target)?;
-        let canonical_target = canonicalize_dir(&target)?;
+        let canonical_target = canonicalize_dir(&target).await?;
         let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
         fs::create_dir_all(&bucket)?;
 
@@ -296,14 +324,18 @@ mod tests {
             snapshots_dir,
         };
         let newest = store
-            .find_nth_latest_path_for(&canonical_target, 1)?
+            .find_nth_latest_path_for(&canonical_target, 1)
+            .await?
             .expect("newest snapshot");
         let second = store
-            .find_nth_latest_path_for(&canonical_target, 2)?
+            .find_nth_latest_path_for(&canonical_target, 2)
+            .await?
             .expect("second newest snapshot");
-        let newest_snapshot =
-            SnapshotTree::load_with_label(newest, String::from("latest")).expect("latest snapshot");
+        let newest_snapshot = SnapshotTree::load_with_label(newest, String::from("latest"))
+            .await
+            .expect("latest snapshot");
         let second_snapshot = SnapshotTree::load_with_label(second, String::from("previous"))
+            .await
             .expect("previous snapshot");
 
         assert_eq!(newest_snapshot.exported_at, Some(40));
@@ -311,13 +343,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn find_nth_latest_for_only_loads_selected_snapshot() -> Result<()> {
+    #[tokio::test]
+    async fn find_nth_latest_for_only_loads_selected_snapshot() -> Result<()> {
         let dir = tempdir()?;
         let snapshots_dir = dir.path().join("snapshots");
         let target = dir.path().join("target");
         fs::create_dir_all(&target)?;
-        let canonical_target = canonicalize_dir(&target)?;
+        let canonical_target = canonicalize_dir(&target).await?;
         let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
         fs::create_dir_all(&bucket)?;
 
@@ -332,10 +364,11 @@ mod tests {
             snapshots_dir,
         };
         let newest = store
-            .find_nth_latest_path_for(&canonical_target, 1)?
+            .find_nth_latest_path_for(&canonical_target, 1)
+            .await?
             .expect("newest snapshot");
         let newest_snapshot =
-            SnapshotTree::load_with_label(newest.clone(), String::from("latest"))?;
+            SnapshotTree::load_with_label(newest.clone(), String::from("latest")).await?;
 
         assert_eq!(
             newest.file_name().and_then(OsStr::to_str),
@@ -345,13 +378,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn find_nth_latest_path_for_returns_path_without_parsing_snapshot() -> Result<()> {
+    #[tokio::test]
+    async fn find_nth_latest_path_for_returns_path_without_parsing_snapshot() -> Result<()> {
         let dir = tempdir()?;
         let snapshots_dir = dir.path().join("snapshots");
         let target = dir.path().join("target");
         fs::create_dir_all(&target)?;
-        let canonical_target = canonicalize_dir(&target)?;
+        let canonical_target = canonicalize_dir(&target).await?;
         let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
         fs::create_dir_all(&bucket)?;
 
@@ -363,15 +396,16 @@ mod tests {
             snapshots_dir,
         };
         let resolved = store
-            .find_nth_latest_path_for(&canonical_target, 1)?
+            .find_nth_latest_path_for(&canonical_target, 1)
+            .await?
             .expect("snapshot path");
 
         assert_eq!(resolved, snapshot_path);
         Ok(())
     }
 
-    #[test]
-    fn prune_bucket_keeps_only_latest_three_shots() -> Result<()> {
+    #[tokio::test]
+    async fn prune_bucket_keeps_only_latest_three_shots() -> Result<()> {
         let dir = tempdir()?;
         let snapshots_dir = dir.path().join("snapshots");
         let bucket = snapshots_dir.join("bucket");
@@ -391,10 +425,11 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             snapshots_dir,
         };
-        store.prune_bucket(&bucket)?;
+        store.prune_bucket(&bucket).await?;
 
         let mut remaining = store
-            .list_ordered_snapshot_paths_in_bucket(&bucket)?
+            .list_ordered_snapshot_paths_in_bucket(&bucket)
+            .await?
             .into_iter()
             .filter_map(|path| {
                 path.file_stem()

@@ -1,10 +1,11 @@
-use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotTree {
@@ -14,18 +15,21 @@ pub struct SnapshotTree {
 }
 
 impl SnapshotTree {
-    pub fn load(path: PathBuf) -> Result<Self> {
+    pub async fn load(path: PathBuf) -> Result<Self> {
         let label = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map_or_else(|| path.display().to_string(), str::to_owned);
-        Self::load_with_label(path, label)
+        Self::load_with_label(path, label).await
     }
 
-    pub fn load_with_label(path: PathBuf, label: String) -> Result<Self> {
+    pub async fn load_with_label(path: PathBuf, label: String) -> Result<Self> {
         let content = fs::read_to_string(&path)
+            .await
             .with_context(|| format!("failed to read gdu export file {}", path.display()))?;
-        Self::from_json_str(label, path, &content)
+        tokio::task::spawn_blocking(move || Self::from_json_str(label, path, &content))
+            .await
+            .context("background JSON parsing task panicked")?
     }
 
     pub fn from_json_str(label: String, source: PathBuf, content: &str) -> Result<Self> {
@@ -120,11 +124,11 @@ fn read_name(object: &serde_json::Map<String, Value>) -> Result<String> {
         .context("gdu node is missing its name field")
 }
 
-pub fn export_snapshot(target: &Path, output: &Path) -> Result<()> {
-    export_snapshot_with_progress(target, output, |_| {})
+pub async fn export_snapshot(target: &Path, output: &Path) -> Result<()> {
+    export_snapshot_with_progress(target, output, |_| {}).await
 }
 
-pub fn export_snapshot_with_progress<F>(
+pub async fn export_snapshot_with_progress<F>(
     target: &Path,
     output: &Path,
     mut on_progress: F,
@@ -146,12 +150,17 @@ where
         {
             Ok(mut child) => {
                 let mut last_progress = None;
+
                 if let Some(stderr) = child.stderr.take() {
                     let reader = BufReader::new(stderr);
-                    for line in reader.split(b'\r') {
-                        let chunk = line.with_context(|| {
+                    let mut segments = reader.split(b'\r');
+                    loop {
+                        let next = segments.next_segment().await.with_context(|| {
                             format!("failed to read progress output from {}", candidate)
                         })?;
+                        let Some(chunk) = next else {
+                            break;
+                        };
                         let text = String::from_utf8_lossy(&chunk).trim().to_string();
                         if text.is_empty() {
                             continue;
@@ -161,7 +170,7 @@ where
                     }
                 }
 
-                let result = child.wait_with_output().with_context(|| {
+                let result = child.wait_with_output().await.with_context(|| {
                     format!(
                         "failed to wait for {} while exporting {}",
                         candidate,

@@ -4,14 +4,14 @@ mod store;
 mod tui;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
-use std::{env, fs, path::Path};
+use std::time::Duration;
+use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tempfile::tempdir;
+use tokio::sync::mpsc;
+use tokio::time::{Instant, interval, sleep};
 
 use analysis::{Analysis, SizeMetric};
 use gdu::{SnapshotTree, export_snapshot_with_progress};
@@ -55,8 +55,8 @@ enum CommandKind {
 
 enum Action {
     Shot { target: PathBuf },
-    CompareFiles { files: Vec<PathBuf> },
-    CompareCurrentWithFile { file: PathBuf, target: PathBuf },
+    CompareFiles { references: Vec<PathBuf> },
+    CompareCurrentWithFile { reference: PathBuf, target: PathBuf },
     DiffTarget { target: PathBuf },
 }
 
@@ -65,27 +65,28 @@ enum BackgroundScanUpdate {
     Finished(Result<()>),
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let action = classify_action(&cli)?;
 
     match action {
         Action::Shot { target } => {
             let store = SnapshotStore::new()?;
-            let stored = store.save_shot(&target)?;
+            let stored = store.save_shot(&target).await?;
             println!(
                 "saved snapshot for {} to {}",
-                canonicalize_dir(&target)?.display(),
+                canonicalize_dir(&target).await?.display(),
                 stored.source.display()
             );
             println!("data dir: {}", store.data_dir().display());
             Ok(())
         }
-        other => run_with_loading(other, &cli),
+        other => run_with_loading(other, &cli).await,
     }
 }
 
-fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
+async fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     let mut session = TerminalSession::start()?;
     let loading_steps = loading_steps_for_action(&action);
     let mut loading = LoadingState::new("gdu-diff", loading_steps);
@@ -93,11 +94,15 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     session.draw_loading(&loading)?;
 
     let snapshots = match action {
-        Action::CompareFiles { files } => load_compare_files(files, &mut session, &mut loading)?,
-        Action::CompareCurrentWithFile { file, target } => {
-            load_compare_current_with_file(file, target, &mut session, &mut loading)?
+        Action::CompareFiles { references } => {
+            load_compare_files(references, &mut session, &mut loading).await?
         }
-        Action::DiffTarget { target } => load_diff_target(target, &mut session, &mut loading)?,
+        Action::CompareCurrentWithFile { reference, target } => {
+            load_compare_current_with_file(reference, target, &mut session, &mut loading).await?
+        }
+        Action::DiffTarget { target } => {
+            load_diff_target(target, &mut session, &mut loading).await?
+        }
         Action::Shot { .. } => unreachable!(),
     };
 
@@ -134,24 +139,26 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     session.draw_loading(&loading)?;
 
     let mut app = App::new(analysis, metric, !cli.dirs_only)?;
-    session.run_app(&mut app)
+    session.run_app(&mut app).await
 }
 
-fn load_compare_files(
-    files: Vec<PathBuf>,
+async fn load_compare_files(
+    references: Vec<PathBuf>,
     session: &mut TerminalSession,
     loading: &mut LoadingState,
 ) -> Result<Vec<SnapshotTree>> {
     loading.set_step(
         1,
         String::from("Load snapshots"),
-        format!("Reading {} snapshot files", files.len()),
+        format!("Reading {} snapshot files", references.len()),
     );
     session.draw_loading(loading)?;
 
-    let total = files.len();
+    let current_dir = env::current_dir().context("failed to get current directory")?;
+    let total = references.len();
     let mut snapshots = Vec::with_capacity(total);
-    for (index, path) in files.into_iter().enumerate() {
+    for (index, reference) in references.into_iter().enumerate() {
+        let path = resolve_snapshot_reference(&reference, &current_dir).await?;
         let progress_base = index as f64 / total.max(1) as f64;
         let progress_span = 1.0 / total.max(1) as f64;
         let detail = format!(
@@ -160,26 +167,30 @@ fn load_compare_files(
             total,
             path.display()
         );
-        snapshots.push(load_snapshot_with_fake_progress(
-            path,
-            None,
-            session,
-            loading,
-            detail,
-            progress_base,
-            progress_span,
-        )?);
+        snapshots.push(
+            load_snapshot_with_fake_progress(
+                path,
+                None,
+                session,
+                loading,
+                detail,
+                progress_base,
+                progress_span,
+            )
+            .await?,
+        );
     }
     loading.set_step_progress(1.0);
     Ok(snapshots)
 }
 
-fn load_compare_current_with_file(
-    file: PathBuf,
+async fn load_compare_current_with_file(
+    reference: PathBuf,
     target: PathBuf,
     session: &mut TerminalSession,
     loading: &mut LoadingState,
 ) -> Result<Vec<SnapshotTree>> {
+    let file = resolve_snapshot_reference(&reference, &target).await?;
     loading.set_step(
         1,
         String::from("Load baseline snapshot"),
@@ -187,7 +198,8 @@ fn load_compare_current_with_file(
     );
     let baseline_detail = format!("Reading {}", file.display());
     let snapshot =
-        load_snapshot_with_fake_progress(file, None, session, loading, baseline_detail, 0.0, 1.0)?;
+        load_snapshot_with_fake_progress(file, None, session, loading, baseline_detail, 0.0, 1.0)
+            .await?;
 
     loading.set_step(
         2,
@@ -195,7 +207,7 @@ fn load_compare_current_with_file(
         format!("Resolving {}", target.display()),
     );
     session.draw_loading(loading)?;
-    let canonical_target = canonicalize_dir(&target)?;
+    let canonical_target = canonicalize_dir(&target).await?;
     loading.set_step_progress(1.0);
 
     loading.set_step(
@@ -212,7 +224,8 @@ fn load_compare_current_with_file(
         session,
         loading,
         format!("Launching gdu-go for {}", canonical_target.display()),
-    )?;
+    )
+    .await?;
 
     loading.set_step(
         4,
@@ -228,12 +241,13 @@ fn load_compare_current_with_file(
         current_detail,
         0.0,
         1.0,
-    )?;
+    )
+    .await?;
 
     Ok(vec![snapshot, current])
 }
 
-fn load_diff_target(
+async fn load_diff_target(
     target: PathBuf,
     session: &mut TerminalSession,
     loading: &mut LoadingState,
@@ -244,7 +258,7 @@ fn load_diff_target(
         format!("Resolving {}", target.display()),
     );
     session.draw_loading(loading)?;
-    let canonical_target = canonicalize_dir(&target)?;
+    let canonical_target = canonicalize_dir(&target).await?;
     loading.set_step_progress(1.0);
 
     loading.set_step(
@@ -254,7 +268,8 @@ fn load_diff_target(
     );
     let store = SnapshotStore::new()?;
     let latest_path = store
-        .find_nth_latest_path_for(&canonical_target, 1)?
+        .find_nth_latest_path_for(&canonical_target, 1)
+        .await?
         .with_context(|| {
             format!(
                 "no stored snapshot found for {} in {}. run `gdu-diff shot {}` first",
@@ -272,7 +287,8 @@ fn load_diff_target(
         latest_detail,
         0.0,
         1.0,
-    )?;
+    )
+    .await?;
     loading.set_detail(format!(
         "Loaded latest stored snapshot for {}",
         canonical_target.display()
@@ -293,7 +309,8 @@ fn load_diff_target(
         session,
         loading,
         format!("Launching gdu-go for {}", canonical_target.display()),
-    )?;
+    )
+    .await?;
 
     loading.set_step(
         4,
@@ -309,12 +326,13 @@ fn load_diff_target(
         current_detail,
         0.0,
         1.0,
-    )?;
+    )
+    .await?;
 
     Ok(vec![latest_snapshot, current])
 }
 
-fn load_snapshot_with_fake_progress(
+async fn load_snapshot_with_fake_progress(
     path: PathBuf,
     label: Option<String>,
     session: &mut TerminalSession,
@@ -323,52 +341,41 @@ fn load_snapshot_with_fake_progress(
     progress_base: f64,
     progress_span: f64,
 ) -> Result<SnapshotTree> {
-    let estimated_duration = estimate_json_load_duration(&path);
+    let estimated_duration = estimate_json_load_duration(&path).await;
     let detail = format!(
         "{detail}\nEstimated load time: ~{}",
         format_estimated_duration(estimated_duration)
     );
-    let display_path = path.display().to_string();
-    let (sender, receiver) = mpsc::sync_channel(1);
 
     loading.set_step_progress(progress_base);
     loading.set_detail(detail);
     session.draw_loading(loading)?;
 
-    thread::spawn(move || {
-        let result = match label {
-            Some(label) => SnapshotTree::load_with_label(path, label),
-            None => SnapshotTree::load(path),
-        };
-        let _ = sender.send(result);
+    let task = tokio::spawn(async move {
+        match label {
+            Some(label) => SnapshotTree::load_with_label(path, label).await,
+            None => SnapshotTree::load(path).await,
+        }
     });
 
     let started_at = Instant::now();
     loop {
-        match receiver.try_recv() {
-            Ok(result) => {
-                loading.set_step_progress((progress_base + progress_span).clamp(0.0, 1.0));
-                session.draw_loading(loading)?;
-                return result;
-            }
-            Err(TryRecvError::Empty) => {
-                let local_progress = (started_at.elapsed().as_secs_f64()
-                    / estimated_duration.as_secs_f64())
-                .min(JSON_LOAD_PROGRESS_CAP);
-                loading.set_step_progress(
-                    (progress_base + progress_span * local_progress).clamp(0.0, 1.0),
-                );
-                let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
-                thread::sleep(JSON_LOAD_PROGRESS_TICK);
-            }
-            Err(TryRecvError::Disconnected) => {
-                bail!("background JSON loader exited unexpectedly while reading {display_path}");
-            }
+        if task.is_finished() {
+            loading.set_step_progress((progress_base + progress_span).clamp(0.0, 1.0));
+            session.draw_loading(loading)?;
+            return task.await.context("background JSON loader task panicked")?;
         }
+
+        let local_progress = (started_at.elapsed().as_secs_f64()
+            / estimated_duration.as_secs_f64())
+        .min(JSON_LOAD_PROGRESS_CAP);
+        loading.set_step_progress((progress_base + progress_span * local_progress).clamp(0.0, 1.0));
+        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
+        sleep(JSON_LOAD_PROGRESS_TICK).await;
     }
 }
 
-fn export_snapshot_with_fake_progress(
+async fn export_snapshot_with_fake_progress(
     target: &Path,
     output: &Path,
     session: &mut TerminalSession,
@@ -378,53 +385,51 @@ fn export_snapshot_with_fake_progress(
     let target = target.to_path_buf();
     let output = output.to_path_buf();
     let display_target = target.display().to_string();
-    let (sender, receiver) = mpsc::channel();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
 
     loading.set_step_progress(0.0);
     loading.set_detail(detail);
     session.draw_loading(loading)?;
 
-    thread::spawn(move || {
+    let task = tokio::spawn(async move {
         let progress_sender = sender.clone();
         let result = export_snapshot_with_progress(&target, &output, |progress| {
             let _ = progress_sender.send(BackgroundScanUpdate::Detail(progress.to_string()));
-        });
+        })
+        .await;
         let _ = sender.send(BackgroundScanUpdate::Finished(result));
     });
 
     let started_at = Instant::now();
+    let mut ticker = interval(SCAN_PROGRESS_TICK);
     loop {
-        let mut finished = None;
-        loop {
-            match receiver.try_recv() {
-                Ok(BackgroundScanUpdate::Detail(detail)) => loading.set_detail(detail),
-                Ok(BackgroundScanUpdate::Finished(result)) => {
-                    finished = Some(result);
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    bail!(
-                        "background gdu export exited unexpectedly while scanning {display_target}"
-                    );
+        tokio::select! {
+            maybe_update = receiver.recv() => {
+                match maybe_update {
+                    Some(BackgroundScanUpdate::Detail(detail)) => loading.set_detail(detail),
+                    Some(BackgroundScanUpdate::Finished(result)) => {
+                        loading.set_step_progress(1.0);
+                        session.draw_loading(loading)?;
+                        task.await.context("background gdu export task panicked")?;
+                        return result;
+                    }
+                    None => {
+                        task.await.context("background gdu export task panicked")?;
+                        bail!("background gdu export exited unexpectedly while scanning {display_target}");
+                    }
                 }
             }
+            _ = ticker.tick() => {
+                loading.set_step_progress(fake_scan_progress(started_at.elapsed()));
+                let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
+            }
         }
-
-        if let Some(result) = finished {
-            loading.set_step_progress(1.0);
-            session.draw_loading(loading)?;
-            return result;
-        }
-
-        loading.set_step_progress(fake_scan_progress(started_at.elapsed()));
-        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
-        thread::sleep(SCAN_PROGRESS_TICK);
     }
 }
 
-fn estimate_json_load_duration(path: &Path) -> Duration {
-    let actual_bytes = fs::metadata(path)
+async fn estimate_json_load_duration(path: &Path) -> Duration {
+    let actual_bytes = tokio::fs::metadata(path)
+        .await
         .map(|metadata| metadata.len())
         .unwrap_or(JSON_LOAD_ESTIMATED_BYTES_PER_SEC);
     let seconds = (actual_bytes.max(1) as f64 / JSON_LOAD_ESTIMATED_BYTES_PER_SEC as f64)
@@ -516,7 +521,7 @@ fn classify_action(cli: &Cli) -> Result<Action> {
     }
 
     let current_dir = env::current_dir().context("failed to get current directory")?;
-    classify_args(&cli.args, current_dir, resolve_snapshot_reference)
+    classify_args(&cli.args, current_dir)
 }
 
 fn is_json_like_path(path: &Path) -> bool {
@@ -529,27 +534,18 @@ fn is_snapshot_reference(path: &Path) -> bool {
     is_json_like_path(path) || parse_shot_alias(path).is_some()
 }
 
-fn classify_args<F>(
-    args: &[PathBuf],
-    current_dir: PathBuf,
-    mut resolve_reference: F,
-) -> Result<Action>
-where
-    F: FnMut(&Path, &Path) -> Result<PathBuf>,
-{
+fn classify_args(args: &[PathBuf], current_dir: PathBuf) -> Result<Action> {
     if args.len() >= 2 && args.iter().all(|arg| is_snapshot_reference(arg)) {
-        let files = args
-            .iter()
-            .map(|arg| resolve_reference(arg, &current_dir))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Action::CompareFiles { files });
+        return Ok(Action::CompareFiles {
+            references: args.to_vec(),
+        });
     }
 
     if args.len() == 1 {
         let arg = &args[0];
         if is_snapshot_reference(arg) {
             return Ok(Action::CompareCurrentWithFile {
-                file: resolve_reference(arg, &current_dir)?,
+                reference: arg.clone(),
                 target: current_dir,
             });
         }
@@ -563,7 +559,7 @@ where
         let file = &args[1];
         if !is_snapshot_reference(&target) && is_snapshot_reference(file) {
             return Ok(Action::CompareCurrentWithFile {
-                file: resolve_reference(file, &target)?,
+                reference: file.clone(),
                 target,
             });
         }
@@ -583,15 +579,16 @@ fn parse_shot_alias(path: &Path) -> Option<usize> {
     suffix.parse::<usize>().ok().filter(|index| *index > 0)
 }
 
-fn resolve_snapshot_reference(path: &Path, target: &Path) -> Result<PathBuf> {
+async fn resolve_snapshot_reference(path: &Path, target: &Path) -> Result<PathBuf> {
     let Some(ordinal) = parse_shot_alias(path) else {
         return Ok(path.to_path_buf());
     };
 
-    let canonical_target = canonicalize_dir(target)?;
+    let canonical_target = canonicalize_dir(target).await?;
     let store = SnapshotStore::new()?;
     let snapshot_path = store
-        .find_nth_latest_path_for(&canonical_target, ordinal)?
+        .find_nth_latest_path_for(&canonical_target, ordinal)
+        .await?
         .with_context(|| missing_shot_message(&store, &canonical_target, ordinal))?;
     Ok(snapshot_path)
 }
@@ -630,8 +627,8 @@ mod tests {
     fn detects_compare_files() {
         let cli = Cli::parse_from(["gdu-diff", "a.json", "b.json"]);
         match classify_action(&cli).expect("classify") {
-            Action::CompareFiles { files } => {
-                assert_eq!(files.len(), 2);
+            Action::CompareFiles { references } => {
+                assert_eq!(references.len(), 2);
             }
             _ => panic!("expected compare files"),
         }
@@ -659,8 +656,8 @@ mod tests {
     fn detects_directory_and_json_as_compare_current() {
         let cli = Cli::parse_from(["gdu-diff", "/tmp", "base.json"]);
         match classify_action(&cli).expect("classify") {
-            Action::CompareCurrentWithFile { file, target } => {
-                assert_eq!(file, PathBuf::from("base.json"));
+            Action::CompareCurrentWithFile { reference, target } => {
+                assert_eq!(reference, PathBuf::from("base.json"));
                 assert_eq!(target, PathBuf::from("/tmp"));
             }
             _ => panic!("expected compare current with file"),
@@ -677,20 +674,12 @@ mod tests {
 
     #[test]
     fn detects_single_alias_as_compare_current() {
-        let action = classify_args(
-            &[PathBuf::from("-3")],
-            PathBuf::from("/cwd"),
-            |path, target| {
-                assert_eq!(path, Path::new("-3"));
-                assert_eq!(target, Path::new("/cwd"));
-                Ok(PathBuf::from("/shots/3.json"))
-            },
-        )
-        .expect("classify");
+        let action =
+            classify_args(&[PathBuf::from("-3")], PathBuf::from("/cwd")).expect("classify");
 
         match action {
-            Action::CompareCurrentWithFile { file, target } => {
-                assert_eq!(file, PathBuf::from("/shots/3.json"));
+            Action::CompareCurrentWithFile { reference, target } => {
+                assert_eq!(reference, PathBuf::from("-3"));
                 assert_eq!(target, PathBuf::from("/cwd"));
             }
             _ => panic!("expected compare current with file"),
@@ -702,17 +691,12 @@ mod tests {
         let action = classify_args(
             &[PathBuf::from("/tmp"), PathBuf::from("-2")],
             PathBuf::from("/cwd"),
-            |path, target| {
-                assert_eq!(path, Path::new("-2"));
-                assert_eq!(target, Path::new("/tmp"));
-                Ok(PathBuf::from("/shots/2.json"))
-            },
         )
         .expect("classify");
 
         match action {
-            Action::CompareCurrentWithFile { file, target } => {
-                assert_eq!(file, PathBuf::from("/shots/2.json"));
+            Action::CompareCurrentWithFile { reference, target } => {
+                assert_eq!(reference, PathBuf::from("-2"));
                 assert_eq!(target, PathBuf::from("/tmp"));
             }
             _ => panic!("expected compare current with file"),
@@ -724,21 +708,14 @@ mod tests {
         let action = classify_args(
             &[PathBuf::from("-1"), PathBuf::from("base.json")],
             PathBuf::from("/cwd"),
-            |path, target| {
-                assert_eq!(target, Path::new("/cwd"));
-                if path == Path::new("-1") {
-                    return Ok(PathBuf::from("/shots/1.json"));
-                }
-                Ok(path.to_path_buf())
-            },
         )
         .expect("classify");
 
         match action {
-            Action::CompareFiles { files } => {
+            Action::CompareFiles { references } => {
                 assert_eq!(
-                    files,
-                    vec![PathBuf::from("/shots/1.json"), PathBuf::from("base.json")]
+                    references,
+                    vec![PathBuf::from("-1"), PathBuf::from("base.json")]
                 );
             }
             _ => panic!("expected compare files"),

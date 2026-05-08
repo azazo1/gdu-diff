@@ -6,11 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clipboard_rs::{Clipboard, ClipboardContext};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -19,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
 };
+use tokio::time::interval;
 
 use crate::analysis::{Analysis, ChangeKind, RowData, SizeMetric, SortMode};
 
@@ -168,8 +170,8 @@ impl TerminalSession {
         Ok(())
     }
 
-    pub fn run_app(&mut self, app: &mut App) -> Result<()> {
-        run_loop(&mut self.terminal, app)
+    pub async fn run_app(&mut self, app: &mut App) -> Result<()> {
+        run_loop(&mut self.terminal, app).await
     }
 
     fn restore(&mut self) -> Result<()> {
@@ -288,8 +290,8 @@ impl App {
                 self.refresh_rows()?;
             }
             KeyCode::Char(' ') => self.toggle_mark_selected_and_advance(),
-            KeyCode::Char('c') => self.copy_relative_path(),
-            KeyCode::Char('C') => self.copy_absolute_path(),
+            KeyCode::Char('c') => return Ok(AppAction::Copy(self.copy_relative_path())),
+            KeyCode::Char('C') => return Ok(AppAction::Copy(self.copy_absolute_path())),
             KeyCode::Char('b') => return Ok(AppAction::OpenShell(self.current_directory_path())),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
@@ -351,14 +353,20 @@ impl App {
         self.refresh_rows_with_selection(Some(child_path))
     }
 
-    fn copy_relative_path(&mut self) {
+    fn copy_relative_path(&self) -> CopyAction {
         let target = self.copy_target();
-        self.copy_to_clipboard(target.relative_path.clone(), "relative path");
+        CopyAction {
+            value: target.relative_path,
+            label: String::from("relative path"),
+        }
     }
 
-    fn copy_absolute_path(&mut self) {
+    fn copy_absolute_path(&self) -> CopyAction {
         let target = self.copy_target();
-        self.copy_to_clipboard(target.absolute_path.clone(), "absolute path");
+        CopyAction {
+            value: target.absolute_path,
+            label: String::from("absolute path"),
+        }
     }
 
     fn copy_target(&self) -> CopyTarget {
@@ -387,20 +395,6 @@ impl App {
 
     fn current_directory_path(&self) -> PathBuf {
         PathBuf::from(self.analysis.display_path(&self.current_path))
-    }
-
-    fn copy_to_clipboard(&mut self, value: String, label: &str) {
-        match ClipboardContext::new().and_then(|clipboard| clipboard.set_text(value.clone())) {
-            Ok(()) => {
-                self.set_status(format!("Copied {label}: {value}"), StatusKind::Info);
-            }
-            Err(error) => {
-                self.set_status(
-                    format!("Failed to copy {label}: {error}"),
-                    StatusKind::Error,
-                );
-            }
-        }
     }
 
     fn set_status(&mut self, text: String, kind: StatusKind) {
@@ -951,7 +945,13 @@ impl App {
     }
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    let mut events = EventStream::new();
+    let mut redraw = interval(Duration::from_millis(250));
+
     loop {
         terminal.draw(|frame| {
             let _ = app.render(frame);
@@ -961,31 +961,73 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
             return Ok(());
         }
 
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match app.on_key(key.code)? {
-                AppAction::None => {}
-                AppAction::OpenShell(path) => open_shell(terminal, app, &path)?,
+        tokio::select! {
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        match app.on_key(key.code)? {
+                            AppAction::None => {}
+                            AppAction::Copy(copy) => copy_to_clipboard(app, copy).await,
+                            AppAction::OpenShell(path) => open_shell(terminal, app, &path).await?,
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error).context("failed to read terminal event"),
+                    None => return Ok(()),
+                }
             }
+            _ = redraw.tick() => {}
         }
     }
 }
 
-fn open_shell(
+async fn copy_to_clipboard(app: &mut App, copy: CopyAction) {
+    let value = copy.value;
+    let label = copy.label;
+    let result = tokio::task::spawn_blocking(move || {
+        ClipboardContext::new()
+            .and_then(|clipboard| clipboard.set_text(value.clone()))
+            .map_err(|error| error.to_string())?;
+        Ok::<String, String>(value)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => {
+            app.set_status(format!("Copied {label}: {value}"), StatusKind::Info);
+        }
+        Ok(Err(error)) => {
+            app.set_status(
+                format!("Failed to copy {label}: {error}"),
+                StatusKind::Error,
+            );
+        }
+        Err(error) => {
+            app.set_status(
+                format!("Failed to copy {label}: {error}"),
+                StatusKind::Error,
+            );
+        }
+    }
+}
+
+async fn open_shell(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     path: &Path,
 ) -> Result<()> {
     suspend_terminal(terminal)?;
-    let shell_result = spawn_shell(path);
+    let path = path.to_path_buf();
+    let display_path = path.clone();
+    let shell_result = tokio::task::spawn_blocking(move || spawn_shell(&path))
+        .await
+        .context("shell task panicked")?;
     let resume_result = resume_terminal(terminal);
 
     match (shell_result, resume_result) {
         (Ok(()), Ok(())) => {
             app.set_status(
-                format!("Returned from shell: {}", path.display()),
+                format!("Returned from shell: {}", display_path.display()),
                 StatusKind::Info,
             );
             Ok(())
@@ -1272,6 +1314,7 @@ struct MarkedSummary {
 
 enum AppAction {
     None,
+    Copy(CopyAction),
     OpenShell(PathBuf),
 }
 
@@ -1649,6 +1692,11 @@ fn extension_style(extension: &str) -> Style {
 struct CopyTarget {
     relative_path: String,
     absolute_path: String,
+}
+
+struct CopyAction {
+    value: String,
+    label: String,
 }
 
 struct StatusMessage {
