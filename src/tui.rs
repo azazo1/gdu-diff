@@ -132,7 +132,7 @@ impl App {
                 self.sort = SortMode::ShareDelta;
                 self.refresh_rows()?;
             }
-            KeyCode::Char(' ') => self.toggle_mark_selected(),
+            KeyCode::Char(' ') => self.toggle_mark_selected_and_advance(),
             KeyCode::Char('c') => self.copy_relative_path(),
             KeyCode::Char('C') => self.copy_absolute_path(),
             KeyCode::Char('b') => return Ok(AppAction::OpenShell(self.current_directory_path())),
@@ -252,7 +252,7 @@ impl App {
         self.status_message = Some(StatusMessage { text, kind });
     }
 
-    fn toggle_mark_selected(&mut self) {
+    fn toggle_mark_selected_and_advance(&mut self) {
         let Some((path, name)) = self
             .selected_row()
             .map(|row| (row.path.clone(), row.name.clone()))
@@ -262,6 +262,7 @@ impl App {
 
         if self.marked_paths.insert(path.clone()) {
             self.set_status(format!("Marked {name}"), StatusKind::Info);
+            self.move_selection(1);
         } else {
             self.marked_paths.remove(&path);
             self.set_status(format!("Unmarked {name}"), StatusKind::Info);
@@ -715,7 +716,7 @@ impl App {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("Space toggles the current row in the marked set"),
+            Line::from("Space toggles the current row in the marked set, then moves down"),
             Line::from("c copies relative path, C copies absolute path"),
             Line::from("b opens a shell in the current view directory"),
             Line::from("Esc clears marked rows, or closes this help"),
@@ -1458,9 +1459,38 @@ mod tests {
 
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
         assert_eq!(app.marked_paths.len(), 1);
+        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
 
         assert!(matches!(app.on_key(KeyCode::Esc)?, AppAction::None));
         assert!(app.marked_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn space_keeps_selection_when_unmarking() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a.bin","asize":10,"dsize":10,"mtime":1},{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a.bin","asize":20,"dsize":20,"mtime":1},{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first, second])?;
+        let mut app = App::new(analysis, SizeMetric::Disk, true)?;
+        app.table_state.select(Some(1));
+
+        assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
+        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
+        assert_eq!(app.marked_paths.len(), 1);
+
+        assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
+        assert!(app.marked_paths.is_empty());
+        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
+
         Ok(())
     }
 
@@ -1490,6 +1520,7 @@ mod tests {
 
         let _ = app.on_key(KeyCode::Char(' '))?;
         assert_eq!(app.marked_paths.len(), 1);
+        app.table_state.select(Some(selected_index));
 
         let _ = app.on_key(KeyCode::Enter)?;
         assert!(app.marked_paths.is_empty());
