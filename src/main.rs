@@ -289,7 +289,7 @@ async fn load_diff_target(
     let latest_detail = format!("Reading {}", latest_path.display());
     let latest_snapshot = load_snapshot_with_progress(
         latest_path,
-        Some(String::from("latest")),
+        None,
         session,
         loading,
         latest_detail,

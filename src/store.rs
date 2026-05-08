@@ -372,13 +372,13 @@ mod tests {
             .find_nth_latest_path_for(&canonical_target, 1)
             .await?
             .expect("newest snapshot");
-        let newest_snapshot =
-            SnapshotTree::load_with_label(newest.clone(), String::from("latest")).await?;
+        let newest_snapshot = SnapshotTree::load_with_progress(newest.clone(), || {}).await?;
 
         assert_eq!(
             newest.file_name().and_then(OsStr::to_str),
             Some("shot-20.json.zst")
         );
+        assert_eq!(newest_snapshot.label, "shot-20");
         assert_eq!(newest_snapshot.exported_at, Some(20));
         Ok(())
     }
