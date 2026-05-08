@@ -39,6 +39,7 @@ pub struct LoadingState {
     title: String,
     current_step: usize,
     total_steps: usize,
+    step_progress: f64,
     action: String,
     detail: String,
     completed: Vec<String>,
@@ -51,6 +52,7 @@ impl LoadingState {
             title: title.into(),
             current_step: 0,
             total_steps: total_steps.max(1),
+            step_progress: 0.0,
             action: String::new(),
             detail: String::new(),
             completed: Vec::new(),
@@ -63,18 +65,31 @@ impl LoadingState {
             self.completed.push(self.action.clone());
         }
         self.current_step = step.min(self.total_steps);
+        self.step_progress = 0.0;
         self.action = action.into();
         self.detail = detail.into();
     }
 
+    pub fn set_step_progress(&mut self, progress: f64) {
+        self.step_progress = progress.clamp(0.0, 1.0);
+    }
+
     pub fn set_detail(&mut self, detail: impl Into<String>) {
         self.detail = detail.into();
+    }
+
+    fn progress_ratio(&self) -> f64 {
+        if self.current_step == 0 {
+            return 0.0;
+        }
+        (((self.current_step - 1) as f64) + self.step_progress) / self.total_steps as f64
     }
 }
 
 pub struct TerminalSession {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     active: bool,
+    last_loading_draw: Option<Instant>,
 }
 
 impl TerminalSession {
@@ -88,11 +103,29 @@ impl TerminalSession {
         Ok(Self {
             terminal,
             active: true,
+            last_loading_draw: None,
         })
     }
 
     pub fn draw_loading(&mut self, loading: &LoadingState) -> Result<()> {
         self.terminal.draw(|frame| render_loading(frame, loading))?;
+        self.last_loading_draw = Some(Instant::now());
+        Ok(())
+    }
+
+    pub fn draw_loading_throttled(
+        &mut self,
+        loading: &LoadingState,
+        interval: Duration,
+    ) -> Result<()> {
+        if self
+            .last_loading_draw
+            .is_some_and(|last| last.elapsed() < interval)
+        {
+            return Ok(());
+        }
+        self.terminal.draw(|frame| render_loading(frame, loading))?;
+        self.last_loading_draw = Some(Instant::now());
         Ok(())
     }
 
@@ -1020,11 +1053,7 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
     ]));
     frame.render_widget(title, sections[0]);
 
-    let ratio = if loading.current_step == 0 {
-        0.0
-    } else {
-        loading.current_step as f64 / loading.total_steps as f64
-    };
+    let ratio = loading.progress_ratio();
     let gauge = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title("Progress"))
         .gauge_style(Style::default().fg(Color::Cyan))
@@ -1645,17 +1674,19 @@ mod tests {
         let first = SnapshotTree::from_json_str(
             "first".into(),
             PathBuf::from("first.json"),
-            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a.bin","asize":10,"dsize":10,"mtime":1},{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a.bin","asize":10,"dsize":10,"mtime":1},{"name":"b.bin","asize":5,"dsize":5,"mtime":1},{"name":"c.bin","asize":2,"dsize":2,"mtime":1}]]"#,
         )?;
         let second = SnapshotTree::from_json_str(
             "second".into(),
             PathBuf::from("second.json"),
-            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a.bin","asize":20,"dsize":20,"mtime":1},{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a.bin","asize":20,"dsize":20,"mtime":1},{"name":"b.bin","asize":7,"dsize":7,"mtime":1},{"name":"c.bin","asize":3,"dsize":3,"mtime":1}]]"#,
         )?;
 
         let analysis = Analysis::new(vec![first, second])?;
         let mut app = App::new(analysis, SizeMetric::Disk, true)?;
-        app.table_state.select(Some(1));
+        app.sort = SortMode::Name;
+        app.refresh_rows()?;
+        app.table_state.select(Some(0));
 
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
         assert_eq!(
@@ -1664,11 +1695,12 @@ mod tests {
         );
         assert_eq!(app.marked_paths.len(), 1);
 
+        app.table_state.select(Some(0));
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
         assert!(app.marked_paths.is_empty());
         assert_eq!(
             app.selected_row().map(|row| row.path.as_str()),
-            Some("a.bin")
+            Some("b.bin")
         );
 
         Ok(())

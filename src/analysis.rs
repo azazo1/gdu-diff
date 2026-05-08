@@ -170,15 +170,31 @@ pub struct Analysis {
     snapshots: Vec<SnapshotIndex>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IndexProgress<'a> {
+    pub snapshot_index: usize,
+    pub snapshot_total: usize,
+    pub snapshot_label: &'a str,
+    pub snapshot_progress: f64,
+    pub current_path: String,
+}
+
+impl IndexProgress<'_> {
+    pub fn overall_progress(&self) -> f64 {
+        (((self.snapshot_index.saturating_sub(1)) as f64) + self.snapshot_progress)
+            / self.snapshot_total.max(1) as f64
+    }
+}
+
 impl Analysis {
     #[cfg(test)]
     pub fn new(snapshots: Vec<SnapshotTree>) -> Result<Self> {
-        Self::new_with_progress(snapshots, |_, _, _| {})
+        Self::new_with_progress(snapshots, |_| {})
     }
 
     pub fn new_with_progress<F>(mut snapshots: Vec<SnapshotTree>, mut on_progress: F) -> Result<Self>
     where
-        F: FnMut(usize, usize, &str),
+        F: FnMut(IndexProgress<'_>),
     {
         if snapshots.len() < 2 {
             bail!("please provide at least two gdu export files");
@@ -189,8 +205,16 @@ impl Analysis {
         let mut indices = Vec::with_capacity(total);
         for (index, snapshot) in snapshots.into_iter().enumerate() {
             let label = snapshot.label.clone();
-            on_progress(index + 1, total, &label);
-            indices.push(SnapshotIndex::from_snapshot(snapshot)?);
+            let progress_index = index + 1;
+            indices.push(SnapshotIndex::from_snapshot(snapshot, |snapshot_progress, current_path| {
+                on_progress(IndexProgress {
+                    snapshot_index: progress_index,
+                    snapshot_total: total,
+                    snapshot_label: &label,
+                    snapshot_progress,
+                    current_path,
+                });
+            })?);
         }
         Ok(Self { snapshots: indices })
     }
@@ -407,9 +431,26 @@ fn change_kind_from_presence_and_delta(
 }
 
 impl SnapshotIndex {
-    fn from_snapshot(snapshot: SnapshotTree) -> Result<Self> {
+    fn from_snapshot<F>(snapshot: SnapshotTree, mut on_progress: F) -> Result<Self>
+    where
+        F: FnMut(f64, String),
+    {
         let mut entries = BTreeMap::new();
-        flatten_node(&snapshot.root, String::new(), None, &mut entries);
+        let tracker = ProgressTracker::new(&snapshot.root);
+        let mut progress = FlattenProgress {
+            tracker: &tracker,
+            on_progress: &mut on_progress,
+        };
+        flatten_node(
+            &snapshot.root,
+            String::new(),
+            None,
+            &mut entries,
+            0,
+            1.0,
+            &mut progress,
+        );
+        on_progress(1.0, snapshot.root.name().to_string());
         if entries.is_empty() {
             bail!("snapshot {} does not contain any entries", snapshot.label);
         }
@@ -426,6 +467,9 @@ fn flatten_node(
     path: String,
     parent: Option<String>,
     out: &mut BTreeMap<String, IndexedEntry>,
+    depth: usize,
+    share: f64,
+    progress: &mut FlattenProgress<'_, impl FnMut(f64, String)>,
 ) -> SizePair {
     match node {
         GduNode::File(file) => {
@@ -446,9 +490,33 @@ fn flatten_node(
         }
         GduNode::Dir(dir) => {
             let mut total = SizePair::default();
+            let dir_children = dir
+                .children
+                .iter()
+                .filter(|child| matches!(child, GduNode::Dir(_)))
+                .count()
+                .max(1);
+            let child_share = if depth < 3 {
+                share / dir_children as f64
+            } else {
+                share
+            };
             for child in &dir.children {
                 let child_path = join_path(&path, child.name());
-                let child_sizes = flatten_node(child, child_path, Some(path.clone()), out);
+                let next_share = if matches!(child, GduNode::Dir(_)) {
+                    child_share
+                } else {
+                    share
+                };
+                let child_sizes = flatten_node(
+                    child,
+                    child_path,
+                    Some(path.clone()),
+                    out,
+                    depth + 1,
+                    next_share,
+                    progress,
+                );
                 total.disk = total.disk.saturating_add(child_sizes.disk);
                 total.apparent = total.apparent.saturating_add(child_sizes.apparent);
             }
@@ -461,6 +529,10 @@ fn flatten_node(
                     is_dir: true,
                     sizes: total,
                 },
+            );
+            (progress.on_progress)(
+                progress.tracker.finish_progress(&path),
+                display_progress_path(&path, &dir.name),
             );
             total
         }
@@ -523,6 +595,85 @@ fn share(part: u64, total: u64) -> f64 {
         0.0
     } else {
         part as f64 / total as f64
+    }
+}
+
+struct ProgressTracker {
+    finish_points: BTreeMap<String, f64>,
+}
+
+struct FlattenProgress<'a, F>
+where
+    F: FnMut(f64, String),
+{
+    tracker: &'a ProgressTracker,
+    on_progress: &'a mut F,
+}
+
+impl ProgressTracker {
+    fn new(root: &GduNode) -> Self {
+        let mut finish_points = BTreeMap::new();
+        assign_finish_points(root, String::new(), 0, 0.0, 1.0, &mut finish_points);
+        Self { finish_points }
+    }
+
+    fn finish_progress(&self, path: &str) -> f64 {
+        self.finish_points.get(path).copied().unwrap_or(1.0)
+    }
+}
+
+fn assign_finish_points(
+    node: &GduNode,
+    path: String,
+    depth: usize,
+    start: f64,
+    end: f64,
+    finish_points: &mut BTreeMap<String, f64>,
+) {
+    let GduNode::Dir(dir) = node else {
+        return;
+    };
+
+    if depth < 3 {
+        let child_dirs = dir
+            .children
+            .iter()
+            .filter(|child| matches!(child, GduNode::Dir(_)))
+            .collect::<Vec<_>>();
+
+        if !child_dirs.is_empty() {
+            let span = (end - start) / child_dirs.len() as f64;
+            for (index, child) in child_dirs.into_iter().enumerate() {
+                let child_path = join_path(&path, child.name());
+                let child_start = start + span * index as f64;
+                let child_end = child_start + span;
+                assign_finish_points(
+                    child,
+                    child_path,
+                    depth + 1,
+                    child_start,
+                    child_end,
+                    finish_points,
+                );
+            }
+        }
+    } else {
+        for child in &dir.children {
+            if matches!(child, GduNode::Dir(_)) {
+                let child_path = join_path(&path, child.name());
+                assign_finish_points(child, child_path, depth + 1, start, end, finish_points);
+            }
+        }
+    }
+
+    finish_points.insert(path, end.clamp(0.0, 1.0));
+}
+
+fn display_progress_path(path: &str, fallback: &str) -> String {
+    if path.is_empty() {
+        fallback.to_string()
+    } else {
+        path.to_string()
     }
 }
 
@@ -633,6 +784,72 @@ mod tests {
                 .to_string()
                 .contains("cannot compare snapshots with different roots")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn index_progress_is_monotonic_and_finishes() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},[{"name":"aa","mtime":1},{"name":"one.bin","asize":10,"dsize":20,"mtime":1}],{"name":"two.bin","asize":30,"dsize":40,"mtime":1}],[{"name":"b","mtime":1},[{"name":"bb","mtime":1},{"name":"three.bin","asize":5,"dsize":8,"mtime":1}]]]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},[{"name":"aa","mtime":1},{"name":"one.bin","asize":12,"dsize":24,"mtime":1}],{"name":"two.bin","asize":18,"dsize":20,"mtime":1}],[{"name":"b","mtime":1},[{"name":"bb","mtime":1},{"name":"three.bin","asize":8,"dsize":12,"mtime":1}]]]]"#,
+        )?;
+
+        let mut overall_progress = Vec::new();
+        let mut per_snapshot_progress = Vec::new();
+        let analysis = Analysis::new_with_progress(vec![first, second], |progress| {
+            overall_progress.push(progress.overall_progress());
+            per_snapshot_progress.push((progress.snapshot_index, progress.snapshot_progress));
+        })?;
+
+        assert_eq!(analysis.snapshot_count(), 2);
+        assert!(!overall_progress.is_empty());
+        assert!(overall_progress.windows(2).all(|window| window[0] <= window[1]));
+        assert_eq!(overall_progress.last().copied(), Some(1.0));
+        assert_eq!(
+            per_snapshot_progress
+                .iter()
+                .filter(|(index, _)| *index == 1)
+                .map(|(_, progress)| *progress)
+                .next_back(),
+            Some(1.0)
+        );
+        assert_eq!(
+            per_snapshot_progress
+                .iter()
+                .filter(|(index, _)| *index == 2)
+                .map(|(_, progress)| *progress)
+                .next_back(),
+            Some(1.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn index_progress_follows_directory_iteration_order() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"z-last","mtime":1},{"name":"one.bin","asize":10,"dsize":10,"mtime":1}],[{"name":"a-first","mtime":1},{"name":"two.bin","asize":10,"dsize":10,"mtime":1}]]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "second".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"z-last","mtime":1},{"name":"one.bin","asize":10,"dsize":10,"mtime":1}],[{"name":"a-first","mtime":1},{"name":"two.bin","asize":10,"dsize":10,"mtime":1}]]]"#,
+        )?;
+
+        let mut overall_progress = Vec::new();
+        Analysis::new_with_progress(vec![first, second], |progress| {
+            overall_progress.push(progress.overall_progress());
+        })?;
+
+        assert!(overall_progress.windows(2).all(|window| window[0] <= window[1]));
+        assert_eq!(overall_progress.last().copied(), Some(1.0));
         Ok(())
     }
 }

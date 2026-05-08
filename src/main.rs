@@ -4,6 +4,7 @@ mod store;
 mod tui;
 
 use std::path::PathBuf;
+use std::time::Duration;
 use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,8 @@ use analysis::{Analysis, SizeMetric};
 use gdu::{SnapshotTree, export_snapshot_with_progress};
 use store::{SnapshotStore, canonicalize_dir};
 use tui::{App, LoadingState, TerminalSession};
+
+const LOADING_DRAW_THROTTLE: Duration = Duration::from_millis(80);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -86,9 +89,17 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     loading.set_step(total_steps.saturating_sub(1), String::from("Build analysis"), "Indexing snapshot trees");
     session.draw_loading(&loading)?;
 
-    let analysis = Analysis::new_with_progress(snapshots, |index, total, label| {
-        loading.set_detail(format!("Indexing snapshot {index}/{total}: {label}"));
-        let _ = session.draw_loading(&loading);
+    let analysis = Analysis::new_with_progress(snapshots, |progress| {
+        loading.set_step_progress(progress.overall_progress());
+        loading.set_detail(format!(
+            "Indexing snapshot {}/{}: {} ({:.0}%)\nCurrent path: {}",
+            progress.snapshot_index,
+            progress.snapshot_total,
+            progress.snapshot_label,
+            progress.snapshot_progress * 100.0,
+            progress.current_path
+        ));
+        let _ = session.draw_loading_throttled(&loading, LOADING_DRAW_THROTTLE);
     })?;
     let metric = if cli.show_apparent_size {
         SizeMetric::Apparent
@@ -114,10 +125,12 @@ fn load_compare_files(
     let total = files.len();
     let mut snapshots = Vec::with_capacity(total);
     for (index, path) in files.into_iter().enumerate() {
+        loading.set_step_progress((index as f64) / total.max(1) as f64);
         loading.set_detail(format!("Reading snapshot {}/{}: {}", index + 1, total, path.display()));
         session.draw_loading(loading)?;
         snapshots.push(SnapshotTree::load(path)?);
     }
+    loading.set_step_progress(1.0);
     Ok(snapshots)
 }
 
@@ -130,10 +143,12 @@ fn load_compare_current_with_file(
     loading.set_step(1, String::from("Load baseline snapshot"), format!("Reading {}", file.display()));
     session.draw_loading(loading)?;
     let snapshot = SnapshotTree::load(file)?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(2, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
     session.draw_loading(loading)?;
     let canonical_target = canonicalize_dir(&target)?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
     session.draw_loading(loading)?;
@@ -141,12 +156,14 @@ fn load_compare_current_with_file(
     let current_path = temp_dir.path().join("current.json");
     export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
         loading.set_detail(progress.to_string());
-        let _ = session.draw_loading(loading);
+        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
     })?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
     session.draw_loading(loading)?;
     let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
+    loading.set_step_progress(1.0);
 
     Ok(vec![snapshot, current])
 }
@@ -159,6 +176,7 @@ fn load_diff_target(
     loading.set_step(1, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
     session.draw_loading(loading)?;
     let canonical_target = canonicalize_dir(&target)?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(2, String::from("Find latest stored snapshot"), canonical_target.display().to_string());
     session.draw_loading(loading)?;
@@ -171,6 +189,7 @@ fn load_diff_target(
             canonical_target.display()
         )
     })?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
     session.draw_loading(loading)?;
@@ -178,12 +197,14 @@ fn load_diff_target(
     let current_path = temp_dir.path().join("current.json");
     export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
         loading.set_detail(progress.to_string());
-        let _ = session.draw_loading(loading);
+        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
     })?;
+    loading.set_step_progress(1.0);
 
     loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
     session.draw_loading(loading)?;
     let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
+    loading.set_step_progress(1.0);
 
     Ok(vec![latest.snapshot, current])
 }
