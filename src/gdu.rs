@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{BufReader as StdBufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -7,6 +9,10 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+pub const COMPRESSED_SNAPSHOT_EXTENSION: &str = "zst";
+pub const SNAPSHOT_FILE_SUFFIX: &str = ".json.zst";
+const GDU_EXPORT_EXTENSION: &str = "json";
+
 #[derive(Clone, Debug)]
 pub struct SnapshotTree {
     pub label: String,
@@ -14,22 +20,51 @@ pub struct SnapshotTree {
     pub root: GduNode,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotLoadProgress {
+    pub read_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub compressed: bool,
+}
+
+impl SnapshotLoadProgress {
+    pub fn ratio(&self) -> Option<f64> {
+        let total = self.total_bytes?;
+        if total == 0 {
+            return Some(1.0);
+        }
+        Some((self.read_bytes as f64 / total as f64).clamp(0.0, 1.0))
+    }
+}
+
 impl SnapshotTree {
-    pub async fn load(path: PathBuf) -> Result<Self> {
+    pub async fn load_with_progress<F>(path: PathBuf, on_progress: F) -> Result<Self>
+    where
+        F: FnMut(SnapshotLoadProgress) + Send + 'static,
+    {
         let label = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(strip_snapshot_suffix)
             .map_or_else(|| path.display().to_string(), str::to_owned);
-        Self::load_with_label(path, label).await
+        Self::load_with_progress_and_label(path, label, on_progress).await
     }
 
     pub async fn load_with_label(path: PathBuf, label: String) -> Result<Self> {
-        let content = fs::read_to_string(&path)
+        Self::load_with_progress_and_label(path, label, |_| {}).await
+    }
+
+    pub async fn load_with_progress_and_label<F>(
+        path: PathBuf,
+        label: String,
+        on_progress: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(SnapshotLoadProgress) + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || load_snapshot_tree(label, path, on_progress))
             .await
-            .with_context(|| format!("failed to read gdu export file {}", path.display()))?;
-        tokio::task::spawn_blocking(move || Self::from_json_str(label, path, &content))
-            .await
-            .context("background JSON parsing task panicked")?
+            .context("background snapshot loader task panicked")?
     }
 
     pub fn from_json_str(label: String, source: PathBuf, content: &str) -> Result<Self> {
@@ -59,6 +94,86 @@ impl SnapshotTree {
             exported_at,
             root,
         })
+    }
+}
+
+fn load_snapshot_tree<F>(label: String, path: PathBuf, mut on_progress: F) -> Result<SnapshotTree>
+where
+    F: FnMut(SnapshotLoadProgress),
+{
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("failed to stat gdu export file {}", path.display()))?;
+    let compressed = is_zstd_snapshot_path(&path);
+    let total_bytes = Some(metadata.len());
+    let file =
+        File::open(&path).with_context(|| format!("failed to read gdu export file {}", path.display()))?;
+    let reader = ProgressReader::new(file, total_bytes, compressed, &mut on_progress);
+    let content = if compressed {
+        let decoder = zstd::stream::Decoder::new(reader)
+            .with_context(|| format!("failed to initialize zstd decoder for {}", path.display()))?;
+        read_utf8(decoder, &path)?
+    } else {
+        read_utf8(reader, &path)?
+    };
+    on_progress(SnapshotLoadProgress {
+        read_bytes: metadata.len(),
+        total_bytes,
+        compressed,
+    });
+    SnapshotTree::from_json_str(label, path, &content)
+}
+
+fn read_utf8(reader: impl Read, path: &Path) -> Result<String> {
+    let mut content = String::new();
+    let mut reader = StdBufReader::new(reader);
+    reader
+        .read_to_string(&mut content)
+        .with_context(|| format!("failed to read gdu export file {}", path.display()))?;
+    Ok(content)
+}
+
+struct ProgressReader<'a, R> {
+    inner: R,
+    read_bytes: u64,
+    total_bytes: Option<u64>,
+    compressed: bool,
+    on_progress: &'a mut dyn FnMut(SnapshotLoadProgress),
+}
+
+impl<'a, R> ProgressReader<'a, R> {
+    fn new(
+        inner: R,
+        total_bytes: Option<u64>,
+        compressed: bool,
+        on_progress: &'a mut dyn FnMut(SnapshotLoadProgress),
+    ) -> Self {
+        Self {
+            inner,
+            read_bytes: 0,
+            total_bytes,
+            compressed,
+            on_progress,
+        }
+    }
+
+    fn emit_progress(&mut self) {
+        (self.on_progress)(SnapshotLoadProgress {
+            read_bytes: self.read_bytes,
+            total_bytes: self.total_bytes,
+            compressed: self.compressed,
+        });
+    }
+}
+
+impl<R> Read for ProgressReader<'_, R>
+where
+    R: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.read_bytes = self.read_bytes.saturating_add(read as u64);
+        self.emit_progress();
+        Ok(read)
     }
 }
 
@@ -136,13 +251,23 @@ pub async fn export_snapshot_with_progress<F>(
 where
     F: FnMut(&str),
 {
+    if output.extension().and_then(|extension| extension.to_str()) != Some(COMPRESSED_SNAPSHOT_EXTENSION)
+    {
+        bail!(
+            "snapshot output must use the {} suffix: {}",
+            SNAPSHOT_FILE_SUFFIX,
+            output.display()
+        );
+    }
+
+    let temp_output = raw_snapshot_temp_path(output);
     let candidates = ["gdu-go", "gdu"];
     let mut not_found = Vec::new();
 
     for candidate in candidates {
         match Command::new(candidate)
             .arg("--output-file")
-            .arg(output)
+            .arg(&temp_output)
             .arg(target)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -178,6 +303,8 @@ where
                     )
                 })?;
                 if result.status.success() {
+                    compress_snapshot_file(&temp_output, output).await?;
+                    let _ = fs::remove_file(&temp_output).await;
                     return Ok(());
                 }
                 let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
@@ -215,13 +342,68 @@ where
     )
 }
 
+pub fn is_zstd_snapshot_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(COMPRESSED_SNAPSHOT_EXTENSION))
+}
+
+pub fn snapshot_output_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("{GDU_EXPORT_EXTENSION}.{COMPRESSED_SNAPSHOT_EXTENSION}"))
+}
+
+fn strip_snapshot_suffix(name: &str) -> &str {
+    name.strip_suffix(SNAPSHOT_FILE_SUFFIX)
+        .or_else(|| name.strip_suffix(".json"))
+        .unwrap_or(name)
+}
+
+fn raw_snapshot_temp_path(output: &Path) -> PathBuf {
+    output.with_extension(GDU_EXPORT_EXTENSION)
+}
+
+async fn compress_snapshot_file(input: &Path, output: &Path) -> Result<()> {
+    let input = input.to_path_buf();
+    let output = output.to_path_buf();
+    tokio::task::spawn_blocking(move || compress_snapshot_file_blocking(&input, &output))
+        .await
+        .context("background snapshot compression task panicked")?
+}
+
+pub(crate) fn compress_snapshot_file_blocking(input: &Path, output: &Path) -> Result<()> {
+    let source =
+        File::open(input).with_context(|| format!("failed to read gdu export file {}", input.display()))?;
+    let destination = File::create(output)
+        .with_context(|| format!("failed to create snapshot file {}", output.display()))?;
+    let mut reader = StdBufReader::new(source);
+    let level = *zstd::compression_level_range().end();
+    let mut encoder = zstd::stream::Encoder::new(BufWriter::new(destination), level)
+        .with_context(|| format!("failed to initialize zstd encoder for {}", output.display()))?;
+    std::io::copy(&mut reader, &mut encoder).with_context(|| {
+        format!(
+            "failed to compress gdu export {} into {}",
+            input.display(),
+            output.display()
+        )
+    })?;
+    encoder
+        .finish()
+        .with_context(|| format!("failed to finalize snapshot file {}", output.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     use anyhow::Result;
+    use tempfile::tempdir;
 
-    use super::{GduNode, SnapshotTree};
+    use super::{
+        GduNode, SNAPSHOT_FILE_SUFFIX, SnapshotTree, compress_snapshot_file_blocking,
+        is_zstd_snapshot_path, snapshot_output_path,
+    };
 
     #[test]
     fn parses_export_tree() -> Result<()> {
@@ -240,5 +422,37 @@ mod tests {
             GduNode::File(_) => panic!("root must be a directory"),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn loads_zstd_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let raw_path = dir.path().join("sample.json");
+        let compressed_path = dir.path().join("sample.json.zst");
+        fs::write(
+            &raw_path,
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":42},[{"name":"/root","mtime":1},{"name":"a.bin","asize":10,"dsize":20,"mtime":1}]]"#,
+        )?;
+        compress_snapshot_file_blocking(&raw_path, &compressed_path)?;
+
+        let snapshot = SnapshotTree::load_with_progress(compressed_path, |_| {}).await?;
+        assert_eq!(snapshot.label, "sample");
+        assert_eq!(snapshot.exported_at, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn detects_zstd_snapshot_path() {
+        assert!(is_zstd_snapshot_path(Path::new("a.json.zst")));
+        assert!(!is_zstd_snapshot_path(Path::new("a.json")));
+    }
+
+    #[test]
+    fn builds_compressed_snapshot_output_path() {
+        assert_eq!(
+            snapshot_output_path(Path::new("/tmp/current.json")),
+            PathBuf::from("/tmp/current.json.zst")
+        );
+        assert_eq!(SNAPSHOT_FILE_SUFFIX, ".json.zst");
     }
 }

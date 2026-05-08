@@ -11,22 +11,20 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, interval, sleep};
+use tokio::time::{Instant, interval};
 
 use analysis::{Analysis, SizeMetric};
-use gdu::{SnapshotTree, export_snapshot_with_progress};
+use gdu::{
+    SnapshotLoadProgress, SnapshotTree, export_snapshot_with_progress, snapshot_output_path,
+};
 use store::{SnapshotStore, canonicalize_dir};
 use tui::{App, LoadingState, LoadingStep, TerminalSession};
 
 const LOADING_DRAW_THROTTLE: Duration = Duration::from_millis(80);
-const JSON_LOAD_PROGRESS_TICK: Duration = Duration::from_millis(16);
-const JSON_LOAD_PROGRESS_CAP: f64 = 0.96;
-const JSON_LOAD_ESTIMATED_BYTES_PER_SEC: u64 = 200 * 1024 * 1024;
-const JSON_LOAD_ESTIMATE_SAFETY_FACTOR: f64 = 1.5;
-const JSON_LOAD_ESTIMATE_MIN: Duration = Duration::from_millis(250);
 const SCAN_PROGRESS_TICK: Duration = Duration::from_millis(16);
 const SCAN_PROGRESS_CAP: f64 = 0.95;
 const SCAN_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(8);
+const SNAPSHOT_LOAD_PROGRESS_CAP: f64 = 0.98;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +61,11 @@ enum Action {
 enum BackgroundScanUpdate {
     Detail(String),
     Finished(Result<()>),
+}
+
+enum BackgroundSnapshotLoadUpdate {
+    Progress(SnapshotLoadProgress),
+    Finished(Result<SnapshotTree>),
 }
 
 #[tokio::main]
@@ -168,7 +171,7 @@ async fn load_compare_files(
             path.display()
         );
         snapshots.push(
-            load_snapshot_with_fake_progress(
+            load_snapshot_with_progress(
                 path,
                 None,
                 session,
@@ -198,7 +201,7 @@ async fn load_compare_current_with_file(
     );
     let baseline_detail = format!("Reading {}", file.display());
     let snapshot =
-        load_snapshot_with_fake_progress(file, None, session, loading, baseline_detail, 0.0, 1.0)
+        load_snapshot_with_progress(file, None, session, loading, baseline_detail, 0.0, 1.0)
             .await?;
 
     loading.set_step(
@@ -217,7 +220,7 @@ async fn load_compare_current_with_file(
     );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
-    let current_path = temp_dir.path().join("current.json");
+    let current_path = snapshot_output_path(&temp_dir.path().join("current.json"));
     export_snapshot_with_fake_progress(
         &canonical_target,
         &current_path,
@@ -233,7 +236,7 @@ async fn load_compare_current_with_file(
         String::from("Parsing generated JSON"),
     );
     let current_detail = String::from("Parsing generated JSON");
-    let current = load_snapshot_with_fake_progress(
+    let current = load_snapshot_with_progress(
         current_path,
         Some(String::from("current")),
         session,
@@ -279,7 +282,7 @@ async fn load_diff_target(
             )
         })?;
     let latest_detail = format!("Reading {}", latest_path.display());
-    let latest_snapshot = load_snapshot_with_fake_progress(
+    let latest_snapshot = load_snapshot_with_progress(
         latest_path,
         Some(String::from("latest")),
         session,
@@ -302,7 +305,7 @@ async fn load_diff_target(
     );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
-    let current_path = temp_dir.path().join("current.json");
+    let current_path = snapshot_output_path(&temp_dir.path().join("current.json"));
     export_snapshot_with_fake_progress(
         &canonical_target,
         &current_path,
@@ -318,7 +321,7 @@ async fn load_diff_target(
         String::from("Parsing generated JSON"),
     );
     let current_detail = String::from("Parsing generated JSON");
-    let current = load_snapshot_with_fake_progress(
+    let current = load_snapshot_with_progress(
         current_path,
         Some(String::from("current")),
         session,
@@ -332,7 +335,7 @@ async fn load_diff_target(
     Ok(vec![latest_snapshot, current])
 }
 
-async fn load_snapshot_with_fake_progress(
+async fn load_snapshot_with_progress(
     path: PathBuf,
     label: Option<String>,
     session: &mut TerminalSession,
@@ -341,37 +344,54 @@ async fn load_snapshot_with_fake_progress(
     progress_base: f64,
     progress_span: f64,
 ) -> Result<SnapshotTree> {
-    let estimated_duration = estimate_json_load_duration(&path).await;
-    let detail = format!(
-        "{detail}\nEstimated load time: ~{}",
-        format_estimated_duration(estimated_duration)
-    );
+    let path_for_task = path.clone();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
 
     loading.set_step_progress(progress_base);
-    loading.set_detail(detail);
+    loading.set_detail(detail.clone());
     session.draw_loading(loading)?;
 
     let task = tokio::spawn(async move {
-        match label {
-            Some(label) => SnapshotTree::load_with_label(path, label).await,
-            None => SnapshotTree::load(path).await,
-        }
+        let progress_sender = sender.clone();
+        let result = match label {
+            Some(label) => {
+                SnapshotTree::load_with_progress_and_label(path_for_task, label, move |progress| {
+                    let _ = progress_sender.send(BackgroundSnapshotLoadUpdate::Progress(progress));
+                })
+                .await
+            }
+            None => SnapshotTree::load_with_progress(path_for_task, move |progress| {
+                let _ = progress_sender.send(BackgroundSnapshotLoadUpdate::Progress(progress));
+            })
+            .await,
+        };
+        let _ = sender.send(BackgroundSnapshotLoadUpdate::Finished(result));
     });
 
-    let started_at = Instant::now();
     loop {
-        if task.is_finished() {
-            loading.set_step_progress((progress_base + progress_span).clamp(0.0, 1.0));
-            session.draw_loading(loading)?;
-            return task.await.context("background JSON loader task panicked")?;
+        match receiver.recv().await {
+            Some(BackgroundSnapshotLoadUpdate::Progress(progress)) => {
+                loading.set_step_progress(
+                    (progress_base + progress_span * snapshot_display_progress(&progress))
+                        .clamp(0.0, 1.0),
+                );
+                loading.set_detail(format_snapshot_load_detail(&detail, &path, &progress));
+                let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
+            }
+            Some(BackgroundSnapshotLoadUpdate::Finished(result)) => {
+                loading.set_step_progress((progress_base + progress_span).clamp(0.0, 1.0));
+                session.draw_loading(loading)?;
+                task.await.context("background snapshot loader task panicked")?;
+                return result;
+            }
+            None => {
+                task.await.context("background snapshot loader task panicked")?;
+                bail!(
+                    "background snapshot loader exited unexpectedly while reading {}",
+                    path.display()
+                );
+            }
         }
-
-        let local_progress = (started_at.elapsed().as_secs_f64()
-            / estimated_duration.as_secs_f64())
-        .min(JSON_LOAD_PROGRESS_CAP);
-        loading.set_step_progress((progress_base + progress_span * local_progress).clamp(0.0, 1.0));
-        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
-        sleep(JSON_LOAD_PROGRESS_TICK).await;
     }
 }
 
@@ -427,16 +447,6 @@ async fn export_snapshot_with_fake_progress(
     }
 }
 
-async fn estimate_json_load_duration(path: &Path) -> Duration {
-    let actual_bytes = tokio::fs::metadata(path)
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or(JSON_LOAD_ESTIMATED_BYTES_PER_SEC);
-    let seconds = (actual_bytes.max(1) as f64 / JSON_LOAD_ESTIMATED_BYTES_PER_SEC as f64)
-        * JSON_LOAD_ESTIMATE_SAFETY_FACTOR;
-    Duration::from_secs_f64(seconds.max(JSON_LOAD_ESTIMATE_MIN.as_secs_f64()))
-}
-
 fn fake_scan_progress(elapsed: Duration) -> f64 {
     eased_fake_progress(elapsed, SCAN_PROGRESS_SETTLE_TIME, SCAN_PROGRESS_CAP)
 }
@@ -455,16 +465,6 @@ fn eased_fake_progress(elapsed: Duration, settle_time: Duration, cap: f64) -> f6
     let ratio = (elapsed.as_secs_f64() / settle_secs).clamp(0.0, 1.0);
     let eased_ratio = 1.0 - (1.0 - ratio).powi(2);
     (cap * eased_ratio).clamp(0.0, cap)
-}
-
-fn format_estimated_duration(duration: Duration) -> String {
-    if duration.as_secs_f64() >= 10.0 {
-        format!("{:.0}s", duration.as_secs_f64())
-    } else if duration.as_secs_f64() >= 1.0 {
-        format!("{:.1}s", duration.as_secs_f64())
-    } else {
-        format!("{}ms", duration.as_millis())
-    }
 }
 
 fn loading_steps_for_action(action: &Action) -> Vec<LoadingStep> {
@@ -525,9 +525,9 @@ fn classify_action(cli: &Cli) -> Result<Action> {
 }
 
 fn is_json_like_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".json") || name.ends_with(".json.zst"))
 }
 
 fn is_snapshot_reference(path: &Path) -> bool {
@@ -602,6 +602,68 @@ fn missing_shot_message(store: &SnapshotStore, target: &Path, ordinal: usize) ->
     )
 }
 
+fn snapshot_display_progress(progress: &SnapshotLoadProgress) -> f64 {
+    match progress.ratio() {
+        Some(ratio) if ratio >= 1.0 => SNAPSHOT_LOAD_PROGRESS_CAP,
+        Some(ratio) => ratio.clamp(0.0, SNAPSHOT_LOAD_PROGRESS_CAP),
+        None => 0.0,
+    }
+}
+
+fn format_snapshot_load_detail(
+    prefix: &str,
+    path: &Path,
+    progress: &SnapshotLoadProgress,
+) -> String {
+    let format_total = |total_bytes: u64| {
+        format!(
+            "{} / {}",
+            format_size(progress.read_bytes),
+            format_size(total_bytes)
+        )
+    };
+    let progress_line = match progress.total_bytes {
+        Some(total_bytes) => match progress.ratio() {
+            Some(ratio) if ratio >= 1.0 => {
+                format!("Read {} from {}, parsing JSON tree", format_total(total_bytes), path.display())
+            }
+            Some(ratio) => format!(
+                "Read {} from {} ({:.0}%)",
+                format_total(total_bytes),
+                path.display(),
+                ratio * 100.0
+            ),
+            None => format!("Read {} from {}", format_total(total_bytes), path.display()),
+        },
+        None => format!(
+            "Read {} from {}",
+            format_size(progress.read_bytes),
+            path.display()
+        ),
+    };
+    let mode_line = if progress.compressed {
+        "Mode: streaming zstd decompression"
+    } else {
+        "Mode: plain JSON read"
+    };
+    format!("{prefix}\n{progress_line}\n{mode_line}")
+}
+
+fn format_size(size: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -610,8 +672,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Action, Cli, SCAN_PROGRESS_CAP, SCAN_PROGRESS_SETTLE_TIME, classify_action, classify_args,
-        fake_scan_progress, parse_shot_alias,
+        Action, Cli, SCAN_PROGRESS_CAP, SCAN_PROGRESS_SETTLE_TIME, SnapshotLoadProgress,
+        classify_action, classify_args, fake_scan_progress, format_snapshot_load_detail,
+        is_json_like_path, parse_shot_alias, snapshot_display_progress,
     };
 
     #[test]
@@ -747,5 +810,37 @@ mod tests {
 
         assert!(half_progress > SCAN_PROGRESS_CAP * 0.5);
         assert!(half_progress < SCAN_PROGRESS_CAP);
+    }
+
+    #[test]
+    fn accepts_compressed_snapshot_paths() {
+        assert!(is_json_like_path(Path::new("base.json")));
+        assert!(is_json_like_path(Path::new("base.json.zst")));
+        assert!(!is_json_like_path(Path::new("base.zst")));
+    }
+
+    #[test]
+    fn snapshot_progress_stops_short_of_complete_until_parse_finishes() {
+        let progress = SnapshotLoadProgress {
+            read_bytes: 10,
+            total_bytes: Some(10),
+            compressed: true,
+        };
+        assert!(snapshot_display_progress(&progress) < 1.0);
+    }
+
+    #[test]
+    fn snapshot_load_detail_mentions_streaming_decompression() {
+        let detail = format_snapshot_load_detail(
+            "Reading snapshot",
+            Path::new("/tmp/base.json.zst"),
+            &SnapshotLoadProgress {
+                read_bytes: 10,
+                total_bytes: Some(20),
+                compressed: true,
+            },
+        );
+        assert!(detail.contains("streaming zstd decompression"));
+        assert!(detail.contains("50%"));
     }
 }

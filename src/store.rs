@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dirs_next::data_dir;
 use tokio::fs;
 
-use crate::gdu::{SnapshotTree, export_snapshot};
+use crate::gdu::{SnapshotTree, SNAPSHOT_FILE_SUFFIX, export_snapshot};
 
 const APPLICATION: &str = "gdu-diff";
 const MAX_BUCKET_NAME_LEN: usize = 120;
@@ -45,7 +45,7 @@ impl SnapshotStore {
             .await
             .with_context(|| format!("failed to create snapshot directory {}", bucket.display()))?;
 
-        let temp_path = bucket.join(format!("pending-{}.json", unix_millis()?));
+        let temp_path = bucket.join(format!("pending-{}{SNAPSHOT_FILE_SUFFIX}", unix_millis()?));
         export_snapshot(&canonical_target, &temp_path).await?;
         let snapshot =
             SnapshotTree::load_with_label(temp_path.clone(), String::from("latest")).await?;
@@ -102,13 +102,13 @@ impl SnapshotStore {
         let stem = exported_at
             .map(|value| format!("shot-{value}"))
             .unwrap_or_else(|| format!("shot-{}", unix_millis().unwrap_or_default()));
-        let primary = bucket.join(format!("{stem}.json"));
+        let primary = bucket.join(format!("{stem}{SNAPSHOT_FILE_SUFFIX}"));
         if !path_exists(&primary).await? {
             return Ok(primary);
         }
 
         for index in 1..1000 {
-            let candidate = bucket.join(format!("{stem}-{index}.json"));
+            let candidate = bucket.join(format!("{stem}-{index}{SNAPSHOT_FILE_SUFFIX}"));
             if !path_exists(&candidate).await? {
                 return Ok(candidate);
             }
@@ -141,7 +141,8 @@ impl SnapshotStore {
             .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(OsStr::to_str) != Some("json") {
+            let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            if !(file_name.ends_with(".json") || file_name.ends_with(SNAPSHOT_FILE_SUFFIX)) {
                 continue;
             }
             paths.push(path);
@@ -174,7 +175,11 @@ fn compare_snapshot_path_order(left: &Path, right: &Path) -> std::cmp::Ordering 
 }
 
 fn snapshot_name_sort_key(path: &Path) -> Option<(u64, u32)> {
-    let stem = path.file_stem()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?;
+    let stem = file_name
+        .strip_suffix(".json.zst")
+        .or_else(|| file_name.strip_suffix(".json"))
+        .unwrap_or(file_name);
     let suffix = stem.strip_prefix("shot-")?;
     let (timestamp, ordinal) = match suffix.split_once('-') {
         Some((timestamp, ordinal)) => (timestamp, ordinal.parse().ok()?),
@@ -258,7 +263,7 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use crate::gdu::SnapshotTree;
+    use crate::gdu::{SnapshotTree, compress_snapshot_file_blocking};
 
     use super::{
         MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, canonicalize_dir,
@@ -284,9 +289,9 @@ mod tests {
 
     #[test]
     fn prefers_newer_snapshot_names() {
-        let older = Path::new("/tmp/shot-10.json");
-        let newer = Path::new("/tmp/shot-20.json");
-        let duplicate = Path::new("/tmp/shot-20-1.json");
+        let older = Path::new("/tmp/shot-10.json.zst");
+        let newer = Path::new("/tmp/shot-20.json.zst");
+        let duplicate = Path::new("/tmp/shot-20-1.json.zst");
 
         assert!(compare_snapshot_path_order(newer, older).is_lt());
         assert!(compare_snapshot_path_order(duplicate, newer).is_lt());
@@ -310,10 +315,10 @@ mod tests {
         fs::create_dir_all(&bucket)?;
 
         for timestamp in [10, 20, 30, 40] {
-            let path = bucket.join(format!("shot-{timestamp}.json"));
-            fs::write(
+            let path = bucket.join(format!("shot-{timestamp}.json.zst"));
+            write_compressed_snapshot(
                 &path,
-                format!(
+                &format!(
                     r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":1,"dsize":1,"mtime":1}}]]"#
                 ),
             )?;
@@ -353,9 +358,9 @@ mod tests {
         let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
         fs::create_dir_all(&bucket)?;
 
-        fs::write(bucket.join("shot-10.json"), "{not valid json")?;
-        fs::write(
-            bucket.join("shot-20.json"),
+        fs::write(bucket.join("shot-10.json.zst"), "{not valid json")?;
+        write_compressed_snapshot(
+            &bucket.join("shot-20.json.zst"),
             r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},{"name":"a","asize":1,"dsize":1,"mtime":1}]]"#,
         )?;
 
@@ -372,7 +377,7 @@ mod tests {
 
         assert_eq!(
             newest.file_name().and_then(OsStr::to_str),
-            Some("shot-20.json")
+            Some("shot-20.json.zst")
         );
         assert_eq!(newest_snapshot.exported_at, Some(20));
         Ok(())
@@ -388,7 +393,7 @@ mod tests {
         let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
         fs::create_dir_all(&bucket)?;
 
-        let snapshot_path = bucket.join("shot-10.json");
+        let snapshot_path = bucket.join("shot-10.json.zst");
         fs::write(&snapshot_path, "not-json")?;
 
         let store = SnapshotStore {
@@ -412,10 +417,10 @@ mod tests {
         fs::create_dir_all(&bucket)?;
 
         for timestamp in [10, 20, 30, 40] {
-            let path = bucket.join(format!("shot-{timestamp}.json"));
-            fs::write(
+            let path = bucket.join(format!("shot-{timestamp}.json.zst"));
+            write_compressed_snapshot(
                 &path,
-                format!(
+                &format!(
                     r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":1,"dsize":1,"mtime":1}}]]"#
                 ),
             )?;
@@ -432,8 +437,7 @@ mod tests {
             .await?
             .into_iter()
             .filter_map(|path| {
-                path.file_stem()
-                    .and_then(OsStr::to_str)
+                snapshot_stem(&path)
                     .and_then(|stem| stem.strip_prefix("shot-"))
                     .and_then(|value| value.parse::<u64>().ok())
             })
@@ -443,5 +447,20 @@ mod tests {
         assert_eq!(remaining.len(), MAX_SHOTS_PER_BUCKET);
         assert_eq!(remaining, vec![20, 30, 40]);
         Ok(())
+    }
+
+    fn write_compressed_snapshot(path: &Path, content: &str) -> Result<()> {
+        let raw_path = path.with_extension("json");
+        fs::write(&raw_path, content)?;
+        compress_snapshot_file_blocking(&raw_path, path)?;
+        fs::remove_file(raw_path)?;
+        Ok(())
+    }
+
+    fn snapshot_stem(path: &Path) -> Option<&str> {
+        let file_name = path.file_name()?.to_str()?;
+        file_name
+            .strip_suffix(".json.zst")
+            .or_else(|| file_name.strip_suffix(".json"))
     }
 }
