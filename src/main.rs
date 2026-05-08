@@ -4,8 +4,10 @@ mod store;
 mod tui;
 
 use std::path::PathBuf;
-use std::time::Duration;
-use std::{env, path::Path};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::{env, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -17,6 +19,11 @@ use store::{SnapshotStore, canonicalize_dir};
 use tui::{App, LoadingState, TerminalSession};
 
 const LOADING_DRAW_THROTTLE: Duration = Duration::from_millis(80);
+const JSON_LOAD_PROGRESS_TICK: Duration = Duration::from_millis(16);
+const JSON_LOAD_PROGRESS_CAP: f64 = 0.96;
+const JSON_LOAD_ESTIMATED_BYTES_PER_SEC: u64 = 200 * 1024 * 1024;
+const JSON_LOAD_ESTIMATE_SAFETY_FACTOR: f64 = 1.5;
+const JSON_LOAD_ESTIMATE_MIN: Duration = Duration::from_millis(250);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -137,15 +144,18 @@ fn load_compare_files(
     let total = files.len();
     let mut snapshots = Vec::with_capacity(total);
     for (index, path) in files.into_iter().enumerate() {
-        loading.set_step_progress((index as f64) / total.max(1) as f64);
-        loading.set_detail(format!(
-            "Reading snapshot {}/{}: {}",
-            index + 1,
-            total,
-            path.display()
-        ));
-        session.draw_loading(loading)?;
-        snapshots.push(SnapshotTree::load(path)?);
+        let progress_base = index as f64 / total.max(1) as f64;
+        let progress_span = 1.0 / total.max(1) as f64;
+        let detail = format!("Reading snapshot {}/{}: {}", index + 1, total, path.display());
+        snapshots.push(load_snapshot_with_fake_progress(
+            path,
+            None,
+            session,
+            loading,
+            detail,
+            progress_base,
+            progress_span,
+        )?);
     }
     loading.set_step_progress(1.0);
     Ok(snapshots)
@@ -162,9 +172,16 @@ fn load_compare_current_with_file(
         String::from("Load baseline snapshot"),
         format!("Reading {}", file.display()),
     );
-    session.draw_loading(loading)?;
-    let snapshot = SnapshotTree::load(file)?;
-    loading.set_step_progress(1.0);
+    let baseline_detail = format!("Reading {}", file.display());
+    let snapshot = load_snapshot_with_fake_progress(
+        file,
+        None,
+        session,
+        loading,
+        baseline_detail,
+        0.0,
+        1.0,
+    )?;
 
     loading.set_step(
         2,
@@ -194,9 +211,16 @@ fn load_compare_current_with_file(
         String::from("Load current snapshot"),
         String::from("Parsing generated JSON"),
     );
-    session.draw_loading(loading)?;
-    let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
-    loading.set_step_progress(1.0);
+    let current_detail = String::from("Parsing generated JSON");
+    let current = load_snapshot_with_fake_progress(
+        current_path,
+        Some(String::from("current")),
+        session,
+        loading,
+        current_detail,
+        0.0,
+        1.0,
+    )?;
 
     Ok(vec![snapshot, current])
 }
@@ -251,11 +275,91 @@ fn load_diff_target(
         String::from("Load current snapshot"),
         String::from("Parsing generated JSON"),
     );
-    session.draw_loading(loading)?;
-    let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
-    loading.set_step_progress(1.0);
+    let current_detail = String::from("Parsing generated JSON");
+    let current = load_snapshot_with_fake_progress(
+        current_path,
+        Some(String::from("current")),
+        session,
+        loading,
+        current_detail,
+        0.0,
+        1.0,
+    )?;
 
     Ok(vec![latest.snapshot, current])
+}
+
+fn load_snapshot_with_fake_progress(
+    path: PathBuf,
+    label: Option<String>,
+    session: &mut TerminalSession,
+    loading: &mut LoadingState,
+    detail: String,
+    progress_base: f64,
+    progress_span: f64,
+) -> Result<SnapshotTree> {
+    let estimated_duration = estimate_json_load_duration(&path);
+    let detail = format!(
+        "{detail}\nEstimated load time: ~{}",
+        format_estimated_duration(estimated_duration)
+    );
+    let display_path = path.display().to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+
+    loading.set_step_progress(progress_base);
+    loading.set_detail(detail);
+    session.draw_loading(loading)?;
+
+    thread::spawn(move || {
+        let result = match label {
+            Some(label) => SnapshotTree::load_with_label(path, label),
+            None => SnapshotTree::load(path),
+        };
+        let _ = sender.send(result);
+    });
+
+    let started_at = Instant::now();
+    loop {
+        match receiver.try_recv() {
+            Ok(result) => {
+                loading.set_step_progress((progress_base + progress_span).clamp(0.0, 1.0));
+                session.draw_loading(loading)?;
+                return result;
+            }
+            Err(TryRecvError::Empty) => {
+                let local_progress = (started_at.elapsed().as_secs_f64()
+                    / estimated_duration.as_secs_f64())
+                .min(JSON_LOAD_PROGRESS_CAP);
+                loading.set_step_progress(
+                    (progress_base + progress_span * local_progress).clamp(0.0, 1.0),
+                );
+                let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
+                thread::sleep(JSON_LOAD_PROGRESS_TICK);
+            }
+            Err(TryRecvError::Disconnected) => {
+                bail!("background JSON loader exited unexpectedly while reading {display_path}");
+            }
+        }
+    }
+}
+
+fn estimate_json_load_duration(path: &Path) -> Duration {
+    let actual_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(JSON_LOAD_ESTIMATED_BYTES_PER_SEC);
+    let seconds = (actual_bytes.max(1) as f64 / JSON_LOAD_ESTIMATED_BYTES_PER_SEC as f64)
+        * JSON_LOAD_ESTIMATE_SAFETY_FACTOR;
+    Duration::from_secs_f64(seconds.max(JSON_LOAD_ESTIMATE_MIN.as_secs_f64()))
+}
+
+fn format_estimated_duration(duration: Duration) -> String {
+    if duration.as_secs_f64() >= 10.0 {
+        format!("{:.0}s", duration.as_secs_f64())
+    } else if duration.as_secs_f64() >= 1.0 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn total_steps_for_action(action: &Action) -> usize {
