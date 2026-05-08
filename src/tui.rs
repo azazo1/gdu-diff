@@ -345,11 +345,12 @@ impl App {
 
         if self.marked_paths.insert(path.clone()) {
             self.set_status(format!("Marked {name}"), StatusKind::Info);
-            self.move_selection(1);
         } else {
             self.marked_paths.remove(&path);
             self.set_status(format!("Unmarked {name}"), StatusKind::Info);
         }
+
+        self.move_selection(1);
     }
 
     fn clear_marked_silently(&mut self) {
@@ -1640,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn space_keeps_selection_when_unmarking() -> Result<()> {
+    fn space_advances_selection_when_unmarking() -> Result<()> {
         let first = SnapshotTree::from_json_str(
             "first".into(),
             PathBuf::from("first.json"),
@@ -1667,7 +1668,7 @@ mod tests {
         assert!(app.marked_paths.is_empty());
         assert_eq!(
             app.selected_row().map(|row| row.path.as_str()),
-            Some("b.bin")
+            Some("a.bin")
         );
 
         Ok(())
