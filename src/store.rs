@@ -231,7 +231,9 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::{
+    use crate::gdu::SnapshotTree;
+
+use super::{
         MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, canonicalize_dir,
         compare_snapshot_path_order, encode_bucket_name,
     };

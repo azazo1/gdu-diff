@@ -1087,11 +1087,7 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!(
-                "step {}/{}",
-                loading.current_step,
-                loading.total_steps()
-            ),
+            format!("step {}/{}", loading.current_step, loading.total_steps()),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -1132,13 +1128,13 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
             let is_completed = step.progress >= 1.0;
             let (marker, marker_style, action_style) = if is_completed {
                 (
-                    "x",
+                    "[x]",
                     Style::default().fg(Color::Green),
                     Style::default().fg(Color::Green),
                 )
             } else if is_current {
                 (
-                    ">",
+                    "[>]",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -1148,7 +1144,7 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
                 )
             } else {
                 (
-                    ".",
+                    "[ ]",
                     Style::default().fg(Color::DarkGray),
                     Style::default().fg(Color::DarkGray),
                 )
