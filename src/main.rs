@@ -24,6 +24,9 @@ const JSON_LOAD_PROGRESS_CAP: f64 = 0.96;
 const JSON_LOAD_ESTIMATED_BYTES_PER_SEC: u64 = 200 * 1024 * 1024;
 const JSON_LOAD_ESTIMATE_SAFETY_FACTOR: f64 = 1.5;
 const JSON_LOAD_ESTIMATE_MIN: Duration = Duration::from_millis(250);
+const SCAN_PROGRESS_TICK: Duration = Duration::from_millis(16);
+const SCAN_PROGRESS_CAP: f64 = 0.95;
+const SCAN_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(8);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,6 +58,11 @@ enum Action {
     CompareFiles { files: Vec<PathBuf> },
     CompareCurrentWithFile { file: PathBuf, target: PathBuf },
     DiffTarget { target: PathBuf },
+}
+
+enum BackgroundScanUpdate {
+    Detail(String),
+    Finished(Result<()>),
 }
 
 fn main() -> Result<()> {
@@ -146,7 +154,12 @@ fn load_compare_files(
     for (index, path) in files.into_iter().enumerate() {
         let progress_base = index as f64 / total.max(1) as f64;
         let progress_span = 1.0 / total.max(1) as f64;
-        let detail = format!("Reading snapshot {}/{}: {}", index + 1, total, path.display());
+        let detail = format!(
+            "Reading snapshot {}/{}: {}",
+            index + 1,
+            total,
+            path.display()
+        );
         snapshots.push(load_snapshot_with_fake_progress(
             path,
             None,
@@ -173,15 +186,8 @@ fn load_compare_current_with_file(
         format!("Reading {}", file.display()),
     );
     let baseline_detail = format!("Reading {}", file.display());
-    let snapshot = load_snapshot_with_fake_progress(
-        file,
-        None,
-        session,
-        loading,
-        baseline_detail,
-        0.0,
-        1.0,
-    )?;
+    let snapshot =
+        load_snapshot_with_fake_progress(file, None, session, loading, baseline_detail, 0.0, 1.0)?;
 
     loading.set_step(
         2,
@@ -200,11 +206,13 @@ fn load_compare_current_with_file(
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
     let current_path = temp_dir.path().join("current.json");
-    export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
-        loading.set_detail(progress.to_string());
-        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
-    })?;
-    loading.set_step_progress(1.0);
+    export_snapshot_with_fake_progress(
+        &canonical_target,
+        &current_path,
+        session,
+        loading,
+        format!("Launching gdu-go for {}", canonical_target.display()),
+    )?;
 
     loading.set_step(
         4,
@@ -279,11 +287,13 @@ fn load_diff_target(
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
     let current_path = temp_dir.path().join("current.json");
-    export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
-        loading.set_detail(progress.to_string());
-        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
-    })?;
-    loading.set_step_progress(1.0);
+    export_snapshot_with_fake_progress(
+        &canonical_target,
+        &current_path,
+        session,
+        loading,
+        format!("Launching gdu-go for {}", canonical_target.display()),
+    )?;
 
     loading.set_step(
         4,
@@ -358,6 +368,61 @@ fn load_snapshot_with_fake_progress(
     }
 }
 
+fn export_snapshot_with_fake_progress(
+    target: &Path,
+    output: &Path,
+    session: &mut TerminalSession,
+    loading: &mut LoadingState,
+    detail: String,
+) -> Result<()> {
+    let target = target.to_path_buf();
+    let output = output.to_path_buf();
+    let display_target = target.display().to_string();
+    let (sender, receiver) = mpsc::channel();
+
+    loading.set_step_progress(0.0);
+    loading.set_detail(detail);
+    session.draw_loading(loading)?;
+
+    thread::spawn(move || {
+        let progress_sender = sender.clone();
+        let result = export_snapshot_with_progress(&target, &output, |progress| {
+            let _ = progress_sender.send(BackgroundScanUpdate::Detail(progress.to_string()));
+        });
+        let _ = sender.send(BackgroundScanUpdate::Finished(result));
+    });
+
+    let started_at = Instant::now();
+    loop {
+        let mut finished = None;
+        loop {
+            match receiver.try_recv() {
+                Ok(BackgroundScanUpdate::Detail(detail)) => loading.set_detail(detail),
+                Ok(BackgroundScanUpdate::Finished(result)) => {
+                    finished = Some(result);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    bail!(
+                        "background gdu export exited unexpectedly while scanning {display_target}"
+                    );
+                }
+            }
+        }
+
+        if let Some(result) = finished {
+            loading.set_step_progress(1.0);
+            session.draw_loading(loading)?;
+            return result;
+        }
+
+        loading.set_step_progress(fake_scan_progress(started_at.elapsed()));
+        let _ = session.draw_loading_throttled(loading, LOADING_DRAW_THROTTLE);
+        thread::sleep(SCAN_PROGRESS_TICK);
+    }
+}
+
 fn estimate_json_load_duration(path: &Path) -> Duration {
     let actual_bytes = fs::metadata(path)
         .map(|metadata| metadata.len())
@@ -365,6 +430,26 @@ fn estimate_json_load_duration(path: &Path) -> Duration {
     let seconds = (actual_bytes.max(1) as f64 / JSON_LOAD_ESTIMATED_BYTES_PER_SEC as f64)
         * JSON_LOAD_ESTIMATE_SAFETY_FACTOR;
     Duration::from_secs_f64(seconds.max(JSON_LOAD_ESTIMATE_MIN.as_secs_f64()))
+}
+
+fn fake_scan_progress(elapsed: Duration) -> f64 {
+    eased_fake_progress(elapsed, SCAN_PROGRESS_SETTLE_TIME, SCAN_PROGRESS_CAP)
+}
+
+fn eased_fake_progress(elapsed: Duration, settle_time: Duration, cap: f64) -> f64 {
+    let cap = cap.clamp(0.0, 1.0);
+    if cap <= 0.0 {
+        return 0.0;
+    }
+
+    let settle_secs = settle_time.as_secs_f64();
+    if settle_secs <= f64::EPSILON {
+        return cap;
+    }
+
+    let ratio = (elapsed.as_secs_f64() / settle_secs).clamp(0.0, 1.0);
+    let eased_ratio = 1.0 - (1.0 - ratio).powi(2);
+    (cap * eased_ratio).clamp(0.0, cap)
 }
 
 fn format_estimated_duration(duration: Duration) -> String {
@@ -523,10 +608,14 @@ fn missing_shot_message(store: &SnapshotStore, target: &Path, ordinal: usize) ->
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use clap::Parser;
 
-    use super::{Action, Cli, classify_action, classify_args, parse_shot_alias};
+    use super::{
+        Action, Cli, SCAN_PROGRESS_CAP, SCAN_PROGRESS_SETTLE_TIME, classify_action, classify_args,
+        fake_scan_progress, parse_shot_alias,
+    };
 
     #[test]
     fn defaults_to_diff_current_dir() {
@@ -654,5 +743,32 @@ mod tests {
             }
             _ => panic!("expected compare files"),
         }
+    }
+
+    #[test]
+    fn scan_fake_progress_is_monotonic_and_caps_at_ninety_five() {
+        let checkpoints = [
+            Duration::from_secs(0),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+        ];
+        let values = checkpoints.map(fake_scan_progress);
+
+        assert_eq!(values[0], 0.0);
+        assert!(values.windows(2).all(|window| window[0] <= window[1]));
+        assert!((values[4] - SCAN_PROGRESS_CAP).abs() < 1e-9);
+        assert!((values[5] - SCAN_PROGRESS_CAP).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scan_fake_progress_uses_a_nonlinear_curve() {
+        let half_time = Duration::from_secs_f64(SCAN_PROGRESS_SETTLE_TIME.as_secs_f64() / 2.0);
+        let half_progress = fake_scan_progress(half_time);
+
+        assert!(half_progress > SCAN_PROGRESS_CAP * 0.5);
+        assert!(half_progress < SCAN_PROGRESS_CAP);
     }
 }

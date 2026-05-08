@@ -133,7 +133,6 @@ impl SnapshotStore {
         paths.sort_by(|left, right| compare_snapshot_path_order(left, right));
         Ok(paths)
     }
-
 }
 
 pub fn canonicalize_dir(target: &Path) -> Result<PathBuf> {
@@ -233,7 +232,7 @@ mod tests {
 
     use crate::gdu::SnapshotTree;
 
-use super::{
+    use super::{
         MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, canonicalize_dir,
         compare_snapshot_path_order, encode_bucket_name,
     };
@@ -304,8 +303,8 @@ use super::{
             .expect("second newest snapshot");
         let newest_snapshot =
             SnapshotTree::load_with_label(newest, String::from("latest")).expect("latest snapshot");
-        let second_snapshot =
-            SnapshotTree::load_with_label(second, String::from("previous")).expect("previous snapshot");
+        let second_snapshot = SnapshotTree::load_with_label(second, String::from("previous"))
+            .expect("previous snapshot");
 
         assert_eq!(newest_snapshot.exported_at, Some(40));
         assert_eq!(second_snapshot.exported_at, Some(30));
@@ -335,10 +334,8 @@ use super::{
         let newest = store
             .find_nth_latest_path_for(&canonical_target, 1)?
             .expect("newest snapshot");
-        let newest_snapshot = SnapshotTree::load_with_label(
-            newest.clone(),
-            String::from("latest"),
-        )?;
+        let newest_snapshot =
+            SnapshotTree::load_with_label(newest.clone(), String::from("latest"))?;
 
         assert_eq!(
             newest.file_name().and_then(OsStr::to_str),
