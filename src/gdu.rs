@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -120,18 +121,45 @@ fn read_name(object: &serde_json::Map<String, Value>) -> Result<String> {
 }
 
 pub fn export_snapshot(target: &Path, output: &Path) -> Result<()> {
+    export_snapshot_with_progress(target, output, |_| {})
+}
+
+pub fn export_snapshot_with_progress<F>(target: &Path, output: &Path, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
     let candidates = ["gdu-go", "gdu"];
     let mut not_found = Vec::new();
 
     for candidate in candidates {
         match Command::new(candidate)
-            .arg("--no-progress")
             .arg("--output-file")
             .arg(output)
             .arg(target)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
         {
-            Ok(result) => {
+            Ok(mut child) => {
+                let mut last_progress = None;
+                if let Some(stderr) = child.stderr.take() {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.split(b'\r') {
+                        let chunk = line.with_context(|| {
+                            format!("failed to read progress output from {}", candidate)
+                        })?;
+                        let text = String::from_utf8_lossy(&chunk).trim().to_string();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        last_progress = Some(text.clone());
+                        on_progress(&text);
+                    }
+                }
+
+                let result = child.wait_with_output().with_context(|| {
+                    format!("failed to wait for {} while exporting {}", candidate, target.display())
+                })?;
                 if result.status.success() {
                     return Ok(());
                 }
@@ -141,6 +169,8 @@ pub fn export_snapshot(target: &Path, output: &Path) -> Result<()> {
                     stderr
                 } else if !stdout.is_empty() {
                     stdout
+                } else if let Some(progress) = last_progress {
+                    progress
                 } else {
                     format!("exit status {}", result.status)
                 };

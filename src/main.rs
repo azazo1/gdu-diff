@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 use tempfile::tempdir;
 
 use analysis::{Analysis, SizeMetric};
-use gdu::{SnapshotTree, export_snapshot};
+use gdu::{SnapshotTree, export_snapshot_with_progress};
 use store::{SnapshotStore, canonicalize_dir};
-use tui::{App, run};
+use tui::{App, LoadingState, TerminalSession};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,55 +63,147 @@ fn main() -> Result<()> {
             println!("data dir: {}", store.data_dir().display());
             Ok(())
         }
-        Action::CompareFiles { files } => {
-            let snapshots = files
-                .into_iter()
-                .map(SnapshotTree::load)
-                .collect::<Result<Vec<_>>>()?;
-            run_tui(snapshots, &cli)
-        }
-        Action::CompareCurrentWithFile { file, target } => {
-            let snapshot = SnapshotTree::load(file)?;
-            let canonical_target = canonicalize_dir(&target)?;
-
-            let temp_dir = tempdir().context("failed to create temporary directory")?;
-            let current_path = temp_dir.path().join("current.json");
-            export_snapshot(&canonical_target, &current_path)?;
-            let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
-
-            run_tui(vec![snapshot, current], &cli)
-        }
-        Action::DiffTarget { target } => {
-            let canonical_target = canonicalize_dir(&target)?;
-            let store = SnapshotStore::new()?;
-            let latest = store.find_latest_for(&canonical_target)?.with_context(|| {
-                format!(
-                    "no stored snapshot found for {} in {}. run `gdu-diff shot {}` first",
-                    canonical_target.display(),
-                    store.data_dir().display(),
-                    canonical_target.display()
-                )
-            })?;
-
-            let temp_dir = tempdir().context("failed to create temporary directory")?;
-            let current_path = temp_dir.path().join("current.json");
-            export_snapshot(&canonical_target, &current_path)?;
-            let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
-
-            run_tui(vec![latest.snapshot, current], &cli)
-        }
+        other => run_with_loading(other, &cli),
     }
 }
 
-fn run_tui(snapshots: Vec<SnapshotTree>, cli: &Cli) -> Result<()> {
-    let analysis = Analysis::new(snapshots)?;
+fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
+    let mut session = TerminalSession::start()?;
+    let total_steps = total_steps_for_action(&action);
+    let mut loading = LoadingState::new("gdu-diff", total_steps);
+    loading.set_step(1, action_title(&action), "Preparing inputs");
+    session.draw_loading(&loading)?;
+
+    let snapshots = match action {
+        Action::CompareFiles { files } => load_compare_files(files, &mut session, &mut loading)?,
+        Action::CompareCurrentWithFile { file, target } => {
+            load_compare_current_with_file(file, target, &mut session, &mut loading)?
+        }
+        Action::DiffTarget { target } => load_diff_target(target, &mut session, &mut loading)?,
+        Action::Shot { .. } => unreachable!(),
+    };
+
+    loading.set_step(total_steps.saturating_sub(1), String::from("Build analysis"), "Indexing snapshot trees");
+    session.draw_loading(&loading)?;
+
+    let analysis = Analysis::new_with_progress(snapshots, |index, total, label| {
+        loading.set_detail(format!("Indexing snapshot {index}/{total}: {label}"));
+        let _ = session.draw_loading(&loading);
+    })?;
     let metric = if cli.show_apparent_size {
         SizeMetric::Apparent
     } else {
         SizeMetric::Disk
     };
-    let app = App::new(analysis, metric, !cli.dirs_only)?;
-    run(app)
+
+    loading.set_step(total_steps, String::from("Prepare interface"), "Building initial table view");
+    session.draw_loading(&loading)?;
+
+    let mut app = App::new(analysis, metric, !cli.dirs_only)?;
+    session.run_app(&mut app)
+}
+
+fn load_compare_files(
+    files: Vec<PathBuf>,
+    session: &mut TerminalSession,
+    loading: &mut LoadingState,
+) -> Result<Vec<SnapshotTree>> {
+    loading.set_step(1, String::from("Load snapshots"), format!("Reading {} snapshot files", files.len()));
+    session.draw_loading(loading)?;
+
+    let total = files.len();
+    let mut snapshots = Vec::with_capacity(total);
+    for (index, path) in files.into_iter().enumerate() {
+        loading.set_detail(format!("Reading snapshot {}/{}: {}", index + 1, total, path.display()));
+        session.draw_loading(loading)?;
+        snapshots.push(SnapshotTree::load(path)?);
+    }
+    Ok(snapshots)
+}
+
+fn load_compare_current_with_file(
+    file: PathBuf,
+    target: PathBuf,
+    session: &mut TerminalSession,
+    loading: &mut LoadingState,
+) -> Result<Vec<SnapshotTree>> {
+    loading.set_step(1, String::from("Load baseline snapshot"), format!("Reading {}", file.display()));
+    session.draw_loading(loading)?;
+    let snapshot = SnapshotTree::load(file)?;
+
+    loading.set_step(2, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
+    session.draw_loading(loading)?;
+    let canonical_target = canonicalize_dir(&target)?;
+
+    loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
+    session.draw_loading(loading)?;
+    let temp_dir = tempdir().context("failed to create temporary directory")?;
+    let current_path = temp_dir.path().join("current.json");
+    export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
+        loading.set_detail(progress.to_string());
+        let _ = session.draw_loading(loading);
+    })?;
+
+    loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
+    session.draw_loading(loading)?;
+    let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
+
+    Ok(vec![snapshot, current])
+}
+
+fn load_diff_target(
+    target: PathBuf,
+    session: &mut TerminalSession,
+    loading: &mut LoadingState,
+) -> Result<Vec<SnapshotTree>> {
+    loading.set_step(1, String::from("Resolve target directory"), format!("Resolving {}", target.display()));
+    session.draw_loading(loading)?;
+    let canonical_target = canonicalize_dir(&target)?;
+
+    loading.set_step(2, String::from("Find latest stored snapshot"), canonical_target.display().to_string());
+    session.draw_loading(loading)?;
+    let store = SnapshotStore::new()?;
+    let latest = store.find_latest_for(&canonical_target)?.with_context(|| {
+        format!(
+            "no stored snapshot found for {} in {}. run `gdu-diff shot {}` first",
+            canonical_target.display(),
+            store.data_dir().display(),
+            canonical_target.display()
+        )
+    })?;
+
+    loading.set_step(3, String::from("Scan current directory"), format!("Launching gdu-go for {}", canonical_target.display()));
+    session.draw_loading(loading)?;
+    let temp_dir = tempdir().context("failed to create temporary directory")?;
+    let current_path = temp_dir.path().join("current.json");
+    export_snapshot_with_progress(&canonical_target, &current_path, |progress| {
+        loading.set_detail(progress.to_string());
+        let _ = session.draw_loading(loading);
+    })?;
+
+    loading.set_step(4, String::from("Load current snapshot"), String::from("Parsing generated JSON"));
+    session.draw_loading(loading)?;
+    let current = SnapshotTree::load_with_label(current_path, String::from("current"))?;
+
+    Ok(vec![latest.snapshot, current])
+}
+
+fn total_steps_for_action(action: &Action) -> usize {
+    match action {
+        Action::CompareFiles { .. } => 3,
+        Action::CompareCurrentWithFile { .. } => 6,
+        Action::DiffTarget { .. } => 6,
+        Action::Shot { .. } => 1,
+    }
+}
+
+fn action_title(action: &Action) -> String {
+    match action {
+        Action::CompareFiles { .. } => String::from("Compare snapshots"),
+        Action::CompareCurrentWithFile { .. } => String::from("Compare snapshot with current scan"),
+        Action::DiffTarget { .. } => String::from("Compare latest shot with current scan"),
+        Action::Shot { .. } => String::from("Save snapshot"),
+    }
 }
 
 fn classify_action(cli: &Cli) -> Result<Action> {

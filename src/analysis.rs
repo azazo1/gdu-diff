@@ -171,16 +171,27 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    pub fn new(mut snapshots: Vec<SnapshotTree>) -> Result<Self> {
+    #[cfg(test)]
+    pub fn new(snapshots: Vec<SnapshotTree>) -> Result<Self> {
+        Self::new_with_progress(snapshots, |_, _, _| {})
+    }
+
+    pub fn new_with_progress<F>(mut snapshots: Vec<SnapshotTree>, mut on_progress: F) -> Result<Self>
+    where
+        F: FnMut(usize, usize, &str),
+    {
         if snapshots.len() < 2 {
             bail!("please provide at least two gdu export files");
         }
         ensure_matching_roots(&snapshots)?;
         snapshots.sort_by_key(|snapshot| snapshot.exported_at.unwrap_or(u64::MAX));
-        let indices = snapshots
-            .into_iter()
-            .map(SnapshotIndex::from_snapshot)
-            .collect::<Result<Vec<_>>>()?;
+        let total = snapshots.len();
+        let mut indices = Vec::with_capacity(total);
+        for (index, snapshot) in snapshots.into_iter().enumerate() {
+            let label = snapshot.label.clone();
+            on_progress(index + 1, total, &label);
+            indices.push(SnapshotIndex::from_snapshot(snapshot)?);
+        }
         Ok(Self { snapshots: indices })
     }
 

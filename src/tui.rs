@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clipboard_rs::{Clipboard, ClipboardContext};
@@ -16,7 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::analysis::{Analysis, ChangeKind, RowData, SizeMetric, SortMode};
 
@@ -33,6 +33,89 @@ pub struct App {
     show_help: bool,
     should_quit: bool,
     status_message: Option<StatusMessage>,
+}
+
+pub struct LoadingState {
+    title: String,
+    current_step: usize,
+    total_steps: usize,
+    action: String,
+    detail: String,
+    completed: Vec<String>,
+    started_at: Instant,
+}
+
+impl LoadingState {
+    pub fn new(title: impl Into<String>, total_steps: usize) -> Self {
+        Self {
+            title: title.into(),
+            current_step: 0,
+            total_steps: total_steps.max(1),
+            action: String::new(),
+            detail: String::new(),
+            completed: Vec::new(),
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn set_step(&mut self, step: usize, action: impl Into<String>, detail: impl Into<String>) {
+        if step > self.current_step && !self.action.is_empty() {
+            self.completed.push(self.action.clone());
+        }
+        self.current_step = step.min(self.total_steps);
+        self.action = action.into();
+        self.detail = detail.into();
+    }
+
+    pub fn set_detail(&mut self, detail: impl Into<String>) {
+        self.detail = detail.into();
+    }
+}
+
+pub struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
+}
+
+impl TerminalSession {
+    pub fn start() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.hide_cursor()?;
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    pub fn draw_loading(&mut self, loading: &LoadingState) -> Result<()> {
+        self.terminal.draw(|frame| render_loading(frame, loading))?;
+        Ok(())
+    }
+
+    pub fn run_app(&mut self, app: &mut App) -> Result<()> {
+        run_loop(&mut self.terminal, app)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 impl App {
@@ -795,22 +878,6 @@ impl App {
     }
 }
 
-pub fn run(mut app: App) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = run_loop(&mut terminal, &mut app);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result
-}
-
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|frame| {
@@ -919,6 +986,98 @@ fn format_share_delta(delta: f64) -> String {
     format!("{:+.1}pp", delta * 100.0)
 }
 
+fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let block = Block::default().borders(Borders::ALL).title("Loading");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(5),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            &loading.title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("step {}/{}", loading.current_step.max(1), loading.total_steps),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    frame.render_widget(title, sections[0]);
+
+    let ratio = if loading.current_step == 0 {
+        0.0
+    } else {
+        loading.current_step as f64 / loading.total_steps as f64
+    };
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progress"))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .ratio(ratio)
+        .label(format!("{:.0}%", ratio * 100.0));
+    frame.render_widget(gauge, sections[1]);
+
+    let action = Paragraph::new(Line::from(vec![
+        Span::styled("Action ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &loading.action,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(action, sections[2]);
+
+    let detail = Paragraph::new(loading.detail.as_str())
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+    frame.render_widget(detail, sections[3]);
+
+    let mut completed_lines = loading
+        .completed
+        .iter()
+        .rev()
+        .take(3)
+        .map(|item| {
+            Line::from(vec![
+                Span::styled("[x] ", Style::default().fg(Color::Green)),
+                Span::raw(item),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if completed_lines.is_empty() {
+        completed_lines.push(Line::from(Span::styled(
+            "Waiting for the first stage to finish...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let completed = Paragraph::new(completed_lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Completed"));
+    frame.render_widget(completed, sections[4]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Elapsed ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format_duration(loading.started_at.elapsed())),
+    ]));
+    frame.render_widget(footer, sections[5]);
+}
+
 fn delta_style(delta: i64) -> Style {
     if delta > 0 {
         Style::default().fg(Color::Red)
@@ -936,6 +1095,17 @@ fn share_style(delta: f64) -> Style {
         Style::default().fg(Color::Green)
     } else {
         Style::default()
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
     }
 }
 
