@@ -70,42 +70,27 @@ impl SnapshotStore {
     }
 
     pub fn find_latest_for(&self, target: &Path) -> Result<Option<StoredSnapshot>> {
+        self.find_nth_latest_for(target, 1)
+    }
+
+    pub fn find_nth_latest_for(
+        &self,
+        target: &Path,
+        ordinal_from_newest: usize,
+    ) -> Result<Option<StoredSnapshot>> {
+        if ordinal_from_newest == 0 {
+            bail!("shot index must start at 1");
+        }
+
         let canonical_target = canonicalize_dir(target)?;
         let bucket = self.bucket_dir_for(&canonical_target);
         if !bucket.is_dir() {
             return Ok(None);
         }
 
-        let mut best: Option<StoredSnapshot> = None;
-        for entry in fs::read_dir(&bucket)
-            .with_context(|| format!("failed to read snapshot directory {}", bucket.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(OsStr::to_str) != Some("json") {
-                continue;
-            }
-
-            let label = path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .map_or_else(|| String::from("snapshot"), str::to_owned);
-            let snapshot = SnapshotTree::load_with_label(path.clone(), label)?;
-            let candidate = StoredSnapshot {
-                source: path,
-                snapshot,
-            };
-
-            let replace = match &best {
-                Some(current) => compare_snapshot_order(&candidate, current).is_gt(),
-                None => true,
-            };
-            if replace {
-                best = Some(candidate);
-            }
-        }
-
-        Ok(best)
+        let mut snapshots = self.load_snapshots_in_bucket(&bucket)?;
+        snapshots.sort_by(|left, right| compare_snapshot_order(right, left));
+        Ok(snapshots.into_iter().nth(ordinal_from_newest - 1))
     }
 
     fn bucket_dir_for(&self, canonical_target: &Path) -> PathBuf {
@@ -262,6 +247,7 @@ mod tests {
 
     use super::{
         MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, StoredSnapshot,
+        canonicalize_dir,
         compare_snapshot_order, encode_bucket_name,
     };
     use crate::gdu::SnapshotTree;
@@ -314,6 +300,42 @@ mod tests {
     fn store_can_be_created() -> Result<()> {
         let store = SnapshotStore::new()?;
         assert!(store.data_dir().is_absolute());
+        Ok(())
+    }
+
+    #[test]
+    fn find_nth_latest_for_returns_shots_from_newest_to_oldest() -> Result<()> {
+        let dir = tempdir()?;
+        let snapshots_dir = dir.path().join("snapshots");
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target)?;
+        let canonical_target = canonicalize_dir(&target)?;
+        let bucket = snapshots_dir.join(encode_bucket_name(&canonical_target.to_string_lossy()));
+        fs::create_dir_all(&bucket)?;
+
+        for timestamp in [10, 20, 30, 40] {
+            let path = bucket.join(format!("shot-{timestamp}.json"));
+            fs::write(
+                &path,
+                format!(
+                    r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":1,"dsize":1,"mtime":1}}]]"#
+                ),
+            )?;
+        }
+
+        let store = SnapshotStore {
+            data_dir: dir.path().to_path_buf(),
+            snapshots_dir,
+        };
+        let newest = store
+            .find_nth_latest_for(&canonical_target, 1)?
+            .expect("newest snapshot");
+        let second = store
+            .find_nth_latest_for(&canonical_target, 2)?
+            .expect("second newest snapshot");
+
+        assert_eq!(newest.snapshot.exported_at, Some(40));
+        assert_eq!(second.snapshot.exported_at, Some(30));
         Ok(())
     }
 

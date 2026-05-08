@@ -28,7 +28,7 @@ struct Cli {
     dirs_only: bool,
     #[command(subcommand)]
     command: Option<CommandKind>,
-    #[arg(value_name = "ARG")]
+    #[arg(value_name = "ARG", allow_hyphen_values = true)]
     args: Vec<PathBuf>,
 }
 
@@ -131,34 +131,8 @@ fn classify_action(cli: &Cli) -> Result<Action> {
         });
     }
 
-    if cli.args.len() >= 2 && cli.args.iter().all(|x| is_json_like_path(x)) {
-        return Ok(Action::CompareFiles {
-            files: cli.args.clone(),
-        });
-    }
-
-    if cli.args.len() == 1 {
-        let target = cli.args[0].clone();
-        if is_json_like_path(&target) {
-            return Ok(Action::CompareCurrentWithFile {
-                file: target,
-                target: env::current_dir().context("failed to get current directory")?,
-            });
-        }
-        return Ok(Action::DiffTarget { target });
-    }
-
-    if cli.args.len() == 2 {
-        let target = cli.args[0].clone();
-        let file = cli.args[1].clone();
-        if !is_json_like_path(&target) && is_json_like_path(&file) {
-            return Ok(Action::CompareCurrentWithFile { file, target });
-        }
-    }
-
-    bail!(
-        "use `gdu-diff [directory] snapshot.json` to compare a directory with one snapshot, or pass only JSON files when comparing snapshots directly"
-    )
+    let current_dir = env::current_dir().context("failed to get current directory")?;
+    classify_args(&cli.args, current_dir, resolve_snapshot_reference)
 }
 
 fn is_json_like_path(path: &Path) -> bool {
@@ -167,13 +141,93 @@ fn is_json_like_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
+fn is_snapshot_reference(path: &Path) -> bool {
+    is_json_like_path(path) || parse_shot_alias(path).is_some()
+}
+
+fn classify_args<F>(
+    args: &[PathBuf],
+    current_dir: PathBuf,
+    mut resolve_reference: F,
+) -> Result<Action>
+where
+    F: FnMut(&Path, &Path) -> Result<PathBuf>,
+{
+    if args.len() >= 2 && args.iter().all(|arg| is_snapshot_reference(arg)) {
+        let files = args
+            .iter()
+            .map(|arg| resolve_reference(arg, &current_dir))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Action::CompareFiles { files });
+    }
+
+    if args.len() == 1 {
+        let arg = &args[0];
+        if is_snapshot_reference(arg) {
+            return Ok(Action::CompareCurrentWithFile {
+                file: resolve_reference(arg, &current_dir)?,
+                target: current_dir,
+            });
+        }
+        return Ok(Action::DiffTarget {
+            target: arg.clone(),
+        });
+    }
+
+    if args.len() == 2 {
+        let target = args[0].clone();
+        let file = &args[1];
+        if !is_snapshot_reference(&target) && is_snapshot_reference(file) {
+            return Ok(Action::CompareCurrentWithFile {
+                file: resolve_reference(file, &target)?,
+                target,
+            });
+        }
+    }
+
+    bail!(
+        "use `gdu-diff [directory] snapshot.json` to compare a directory with one snapshot, or pass only JSON files when comparing snapshots directly"
+    )
+}
+
+fn parse_shot_alias(path: &Path) -> Option<usize> {
+    let value = path.to_str()?;
+    let suffix = value.strip_prefix('-')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    suffix.parse::<usize>().ok().filter(|index| *index > 0)
+}
+
+fn resolve_snapshot_reference(path: &Path, target: &Path) -> Result<PathBuf> {
+    let Some(ordinal) = parse_shot_alias(path) else {
+        return Ok(path.to_path_buf());
+    };
+
+    let canonical_target = canonicalize_dir(target)?;
+    let store = SnapshotStore::new()?;
+    let snapshot = store
+        .find_nth_latest_for(&canonical_target, ordinal)?
+        .with_context(|| missing_shot_message(&store, &canonical_target, ordinal))?;
+    Ok(snapshot.source)
+}
+
+fn missing_shot_message(store: &SnapshotStore, target: &Path, ordinal: usize) -> String {
+    format!(
+        "no stored shot -{ordinal} found for {} in {}. run `gdu-diff shot {}` first",
+        target.display(),
+        store.data_dir().display(),
+        target.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use clap::Parser;
 
-    use super::{Action, Cli, classify_action};
+    use super::{Action, Cli, classify_action, classify_args, parse_shot_alias};
 
     #[test]
     fn defaults_to_diff_current_dir() {
@@ -222,6 +276,84 @@ mod tests {
                 assert_eq!(target, PathBuf::from("/tmp"));
             }
             _ => panic!("expected compare current with file"),
+        }
+    }
+
+    #[test]
+    fn parses_shot_alias() {
+        assert_eq!(parse_shot_alias(Path::new("-1")), Some(1));
+        assert_eq!(parse_shot_alias(Path::new("-3")), Some(3));
+        assert_eq!(parse_shot_alias(Path::new("-0")), None);
+        assert_eq!(parse_shot_alias(Path::new("base.json")), None);
+    }
+
+    #[test]
+    fn detects_single_alias_as_compare_current() {
+        let action = classify_args(
+            &[PathBuf::from("-3")],
+            PathBuf::from("/cwd"),
+            |path, target| {
+                assert_eq!(path, Path::new("-3"));
+                assert_eq!(target, Path::new("/cwd"));
+                Ok(PathBuf::from("/shots/3.json"))
+            },
+        )
+        .expect("classify");
+
+        match action {
+            Action::CompareCurrentWithFile { file, target } => {
+                assert_eq!(file, PathBuf::from("/shots/3.json"));
+                assert_eq!(target, PathBuf::from("/cwd"));
+            }
+            _ => panic!("expected compare current with file"),
+        }
+    }
+
+    #[test]
+    fn detects_directory_and_alias_as_compare_current() {
+        let action = classify_args(
+            &[PathBuf::from("/tmp"), PathBuf::from("-2")],
+            PathBuf::from("/cwd"),
+            |path, target| {
+                assert_eq!(path, Path::new("-2"));
+                assert_eq!(target, Path::new("/tmp"));
+                Ok(PathBuf::from("/shots/2.json"))
+            },
+        )
+        .expect("classify");
+
+        match action {
+            Action::CompareCurrentWithFile { file, target } => {
+                assert_eq!(file, PathBuf::from("/shots/2.json"));
+                assert_eq!(target, PathBuf::from("/tmp"));
+            }
+            _ => panic!("expected compare current with file"),
+        }
+    }
+
+    #[test]
+    fn detects_alias_and_json_as_compare_files() {
+        let action = classify_args(
+            &[PathBuf::from("-1"), PathBuf::from("base.json")],
+            PathBuf::from("/cwd"),
+            |path, target| {
+                assert_eq!(target, Path::new("/cwd"));
+                if path == Path::new("-1") {
+                    return Ok(PathBuf::from("/shots/1.json"));
+                }
+                Ok(path.to_path_buf())
+            },
+        )
+        .expect("classify");
+
+        match action {
+            Action::CompareFiles { files } => {
+                assert_eq!(
+                    files,
+                    vec![PathBuf::from("/shots/1.json"), PathBuf::from("base.json")]
+                );
+            }
+            _ => panic!("expected compare files"),
         }
     }
 }

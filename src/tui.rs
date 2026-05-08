@@ -1459,7 +1459,10 @@ mod tests {
 
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
         assert_eq!(app.marked_paths.len(), 1);
-        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
+        assert_eq!(
+            app.selected_row().map(|row| row.path.as_str()),
+            Some("b.bin")
+        );
 
         assert!(matches!(app.on_key(KeyCode::Esc)?, AppAction::None));
         assert!(app.marked_paths.is_empty());
@@ -1484,12 +1487,18 @@ mod tests {
         app.table_state.select(Some(1));
 
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
-        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
+        assert_eq!(
+            app.selected_row().map(|row| row.path.as_str()),
+            Some("b.bin")
+        );
         assert_eq!(app.marked_paths.len(), 1);
 
         assert!(matches!(app.on_key(KeyCode::Char(' '))?, AppAction::None));
         assert!(app.marked_paths.is_empty());
-        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("b.bin"));
+        assert_eq!(
+            app.selected_row().map(|row| row.path.as_str()),
+            Some("b.bin")
+        );
 
         Ok(())
     }

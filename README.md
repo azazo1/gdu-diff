@@ -73,6 +73,23 @@ gdu-diff shot
 
 每个目录最多保留 3 份历史快照。保存新的 `shot` 后, 更旧的快照会自动删除。
 
+也可以在需要传入快照文件的位置使用 `-<n>` 这种别名, 表示这个目录按"从新到旧"排序后的第 `n` 份历史 `shot`:
+
+```bash
+gdu-diff -1
+gdu-diff /path/to/dir -2
+gdu-diff -1 old.json
+gdu-diff old.json -2
+```
+
+其中:
+
+- `-1` 表示最新的一份历史 `shot`
+- `-2` 表示第二新的历史 `shot`
+- `-3` 表示第三新的历史 `shot`
+
+如果 `-<n>` 单独出现, 或者和其他快照文件一起直接对比, 默认按当前工作目录查找对应历史 `shot`。如果写成 `gdu-diff [目录] -<n>`, 则按这个目录查找。
+
 ### 使用历史快照对比当前目录
 
 如果传入一个目录, 或不传参数, 程序会:
@@ -88,16 +105,18 @@ gdu-diff
 
 ### 使用单个 JSON 对比目录
 
-如果只传入一份 `.json` 文件, 程序会重新扫描当前工作目录, 然后对比“这份快照 vs 当前目录”:
+如果只传入一份 `.json` 文件, 程序会重新扫描当前工作目录, 然后对比"这份快照 vs 当前目录":
 
 ```bash
 gdu-diff old.json
+gdu-diff -1
 ```
 
 也可以显式指定要扫描的目录, 语法是 `gdu-diff [目录] snapshot.json`:
 
 ```bash
 gdu-diff /path/to/dir old.json
+gdu-diff /path/to/dir -2
 ```
 
 ### 直接对比两份或多份 JSON
@@ -106,6 +125,8 @@ gdu-diff /path/to/dir old.json
 
 ```bash
 gdu-diff old.json new.json
+gdu-diff -1 old.json
+gdu-diff old.json -2
 gdu-diff 2026-01.json 2026-02.json 2026-03.json
 ```
 
@@ -280,7 +301,7 @@ CLI 入口, 负责:
 
 ```bash
 cargo fmt
-cargo test
+cargo clippy --all-targets --all-features
 cargo run -- assets
 ```
 
