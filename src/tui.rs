@@ -37,54 +37,91 @@ pub struct App {
     status_message: Option<StatusMessage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LoadingStep {
+    action: String,
+    weight: f64,
+    progress: f64,
+}
+
+impl LoadingStep {
+    pub fn new(action: impl Into<String>, weight: f64) -> Self {
+        Self {
+            action: action.into(),
+            weight: if weight.is_finite() && weight > 0.0 {
+                weight
+            } else {
+                1.0
+            },
+            progress: 0.0,
+        }
+    }
+}
+
 pub struct LoadingState {
     title: String,
+    steps: Vec<LoadingStep>,
     current_step: usize,
-    total_steps: usize,
-    step_progress: f64,
-    action: String,
     detail: String,
-    completed: Vec<String>,
     started_at: Instant,
 }
 
 impl LoadingState {
-    pub fn new(title: impl Into<String>, total_steps: usize) -> Self {
+    pub fn new(title: impl Into<String>, mut steps: Vec<LoadingStep>) -> Self {
+        if steps.is_empty() {
+            steps.push(LoadingStep::new("Work", 1.0));
+        }
         Self {
             title: title.into(),
-            current_step: 0,
-            total_steps: total_steps.max(1),
-            step_progress: 0.0,
-            action: String::new(),
+            steps,
+            current_step: 1,
             detail: String::new(),
-            completed: Vec::new(),
             started_at: Instant::now(),
         }
     }
 
     pub fn set_step(&mut self, step: usize, action: impl Into<String>, detail: impl Into<String>) {
-        if step > self.current_step && !self.action.is_empty() {
-            self.completed.push(self.action.clone());
+        let next_step = step.clamp(1, self.steps.len());
+        if next_step > self.current_step {
+            self.steps[self.current_step - 1].progress = 1.0;
         }
-        self.current_step = step.min(self.total_steps);
-        self.step_progress = 0.0;
-        self.action = action.into();
+        self.current_step = next_step;
+        let current = &mut self.steps[self.current_step - 1];
+        current.action = action.into();
+        current.progress = 0.0;
         self.detail = detail.into();
     }
 
     pub fn set_step_progress(&mut self, progress: f64) {
-        self.step_progress = progress.clamp(0.0, 1.0);
+        self.steps[self.current_step - 1].progress = progress.clamp(0.0, 1.0);
     }
 
     pub fn set_detail(&mut self, detail: impl Into<String>) {
         self.detail = detail.into();
     }
 
+    pub fn total_steps(&self) -> usize {
+        self.steps.len()
+    }
+
+    fn current_action(&self) -> &str {
+        self.steps
+            .get(self.current_step.saturating_sub(1))
+            .map(|step| step.action.as_str())
+            .unwrap_or("")
+    }
+
     fn progress_ratio(&self) -> f64 {
-        if self.current_step == 0 {
+        let total_weight = self.steps.iter().map(|step| step.weight).sum::<f64>();
+        if total_weight <= 0.0 {
             return 0.0;
         }
-        (((self.current_step - 1) as f64) + self.step_progress) / self.total_steps as f64
+        let completed_weight = self
+            .steps
+            .iter()
+            .map(|step| step.weight * step.progress.clamp(0.0, 1.0))
+            .sum::<f64>();
+        (completed_weight / total_weight).clamp(0.0, 1.0)
     }
 }
 
@@ -1030,12 +1067,13 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let steps_height = loading.total_steps().min(6) as u16 + 2;
     let sections = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(5),
-        Constraint::Min(3),
+        Constraint::Length(steps_height),
         Constraint::Length(2),
     ])
     .split(inner);
@@ -1051,8 +1089,8 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
         Span::styled(
             format!(
                 "step {}/{}",
-                loading.current_step.max(1),
-                loading.total_steps
+                loading.current_step,
+                loading.total_steps()
             ),
             Style::default().fg(Color::DarkGray),
         ),
@@ -1070,7 +1108,7 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
     let action = Paragraph::new(Line::from(vec![
         Span::styled("Action ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            &loading.action,
+            loading.current_action(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1084,27 +1122,53 @@ fn render_loading(frame: &mut ratatui::Frame, loading: &LoadingState) {
         .block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(detail, sections[3]);
 
-    let mut completed_lines = loading
-        .completed
+    let step_bar_width = usize::from(sections[4].width.saturating_sub(28)).clamp(8, 28);
+    let step_lines = loading
+        .steps
         .iter()
-        .rev()
-        .take(3)
-        .map(|item| {
+        .enumerate()
+        .map(|(index, step)| {
+            let is_current = loading.current_step == index + 1;
+            let is_completed = step.progress >= 1.0;
+            let (marker, marker_style, action_style) = if is_completed {
+                (
+                    "x",
+                    Style::default().fg(Color::Green),
+                    Style::default().fg(Color::Green),
+                )
+            } else if is_current {
+                (
+                    ">",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    ".",
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
             Line::from(vec![
-                Span::styled("[x] ", Style::default().fg(Color::Green)),
-                Span::raw(item),
+                Span::styled(format!("{marker} {:>2} ", index + 1), marker_style),
+                Span::styled(
+                    format!("[{}]", mini_progress_bar(step.progress, step_bar_width)),
+                    marker_style,
+                ),
+                Span::raw(" "),
+                Span::styled(format!("{:>3.0}%", step.progress * 100.0), marker_style),
+                Span::raw(" "),
+                Span::styled(step.action.as_str(), action_style),
             ])
         })
         .collect::<Vec<_>>();
-    if completed_lines.is_empty() {
-        completed_lines.push(Line::from(Span::styled(
-            "Waiting for the first stage to finish...",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    let completed = Paragraph::new(completed_lines)
+    let completed = Paragraph::new(step_lines)
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Completed"));
+        .block(Block::default().borders(Borders::ALL).title("Steps"));
     frame.render_widget(completed, sections[4]);
 
     let footer = Paragraph::new(Line::from(vec![
@@ -1122,6 +1186,15 @@ fn delta_style(delta: i64) -> Style {
     } else {
         Style::default()
     }
+}
+
+fn mini_progress_bar(progress: f64, width: usize) -> String {
+    let width = width.max(1);
+    let filled = ((progress.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    let mut bar = String::with_capacity(width);
+    bar.push_str(&"#".repeat(filled));
+    bar.push_str(&"-".repeat(width - filled));
+    bar
 }
 
 fn share_style(delta: f64) -> Style {

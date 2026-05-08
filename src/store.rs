@@ -15,7 +15,6 @@ const MAX_SHOTS_PER_BUCKET: usize = 3;
 #[derive(Clone, Debug)]
 pub struct StoredSnapshot {
     pub source: PathBuf,
-    pub snapshot: SnapshotTree,
 }
 
 pub struct SnapshotStore {
@@ -56,21 +55,8 @@ impl SnapshotStore {
                 final_path.display()
             )
         })?;
-
-        let label = final_path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .map_or_else(|| String::from("snapshot"), str::to_owned);
-        let snapshot = SnapshotTree::load_with_label(final_path.clone(), label)?;
         self.prune_bucket(&bucket)?;
-        Ok(StoredSnapshot {
-            source: final_path,
-            snapshot,
-        })
-    }
-
-    pub fn find_latest_for(&self, target: &Path) -> Result<Option<StoredSnapshot>> {
-        self.find_nth_latest_for(target, 1)
+        Ok(StoredSnapshot { source: final_path })
     }
 
     pub fn find_nth_latest_path_for(
@@ -90,17 +76,6 @@ impl SnapshotStore {
 
         let paths = self.list_ordered_snapshot_paths_in_bucket(&bucket)?;
         Ok(paths.into_iter().nth(ordinal_from_newest - 1))
-    }
-
-    pub fn find_nth_latest_for(
-        &self,
-        target: &Path,
-        ordinal_from_newest: usize,
-    ) -> Result<Option<StoredSnapshot>> {
-        let Some(path) = self.find_nth_latest_path_for(target, ordinal_from_newest)? else {
-            return Ok(None);
-        };
-        Ok(Some(self.load_snapshot(path)?))
     }
 
     fn bucket_dir_for(&self, canonical_target: &Path) -> PathBuf {
@@ -159,17 +134,6 @@ impl SnapshotStore {
         Ok(paths)
     }
 
-    fn load_snapshot(&self, path: PathBuf) -> Result<StoredSnapshot> {
-        let label = path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .map_or_else(|| String::from("snapshot"), str::to_owned);
-        let snapshot = SnapshotTree::load_with_label(path.clone(), label)?;
-        Ok(StoredSnapshot {
-            source: path,
-            snapshot,
-        })
-    }
 }
 
 pub fn canonicalize_dir(target: &Path) -> Result<PathBuf> {
@@ -331,14 +295,18 @@ mod tests {
             snapshots_dir,
         };
         let newest = store
-            .find_nth_latest_for(&canonical_target, 1)?
+            .find_nth_latest_path_for(&canonical_target, 1)?
             .expect("newest snapshot");
         let second = store
-            .find_nth_latest_for(&canonical_target, 2)?
+            .find_nth_latest_path_for(&canonical_target, 2)?
             .expect("second newest snapshot");
+        let newest_snapshot =
+            SnapshotTree::load_with_label(newest, String::from("latest")).expect("latest snapshot");
+        let second_snapshot =
+            SnapshotTree::load_with_label(second, String::from("previous")).expect("previous snapshot");
 
-        assert_eq!(newest.snapshot.exported_at, Some(40));
-        assert_eq!(second.snapshot.exported_at, Some(30));
+        assert_eq!(newest_snapshot.exported_at, Some(40));
+        assert_eq!(second_snapshot.exported_at, Some(30));
         Ok(())
     }
 
@@ -363,14 +331,18 @@ mod tests {
             snapshots_dir,
         };
         let newest = store
-            .find_nth_latest_for(&canonical_target, 1)?
+            .find_nth_latest_path_for(&canonical_target, 1)?
             .expect("newest snapshot");
+        let newest_snapshot = SnapshotTree::load_with_label(
+            newest.clone(),
+            String::from("latest"),
+        )?;
 
         assert_eq!(
-            newest.source.file_name().and_then(OsStr::to_str),
+            newest.file_name().and_then(OsStr::to_str),
             Some("shot-20.json")
         );
-        assert_eq!(newest.snapshot.exported_at, Some(20));
+        assert_eq!(newest_snapshot.exported_at, Some(20));
         Ok(())
     }
 

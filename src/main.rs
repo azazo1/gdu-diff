@@ -16,7 +16,7 @@ use tempfile::tempdir;
 use analysis::{Analysis, SizeMetric};
 use gdu::{SnapshotTree, export_snapshot_with_progress};
 use store::{SnapshotStore, canonicalize_dir};
-use tui::{App, LoadingState, TerminalSession};
+use tui::{App, LoadingState, LoadingStep, TerminalSession};
 
 const LOADING_DRAW_THROTTLE: Duration = Duration::from_millis(80);
 const JSON_LOAD_PROGRESS_TICK: Duration = Duration::from_millis(16);
@@ -79,8 +79,8 @@ fn main() -> Result<()> {
 
 fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     let mut session = TerminalSession::start()?;
-    let total_steps = total_steps_for_action(&action);
-    let mut loading = LoadingState::new("gdu-diff", total_steps);
+    let loading_steps = loading_steps_for_action(&action);
+    let mut loading = LoadingState::new("gdu-diff", loading_steps);
     loading.set_step(1, action_title(&action), "Preparing inputs");
     session.draw_loading(&loading)?;
 
@@ -94,7 +94,7 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     };
 
     loading.set_step(
-        total_steps.saturating_sub(1),
+        loading.total_steps().saturating_sub(1),
         String::from("Build analysis"),
         "Indexing snapshot trees",
     );
@@ -119,7 +119,7 @@ fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     };
 
     loading.set_step(
-        total_steps,
+        loading.total_steps(),
         String::from("Prepare interface"),
         "Building initial table view",
     );
@@ -241,19 +241,34 @@ fn load_diff_target(
 
     loading.set_step(
         2,
-        String::from("Find latest stored snapshot"),
+        String::from("Load latest stored snapshot"),
         canonical_target.display().to_string(),
     );
-    session.draw_loading(loading)?;
     let store = SnapshotStore::new()?;
-    let latest = store.find_latest_for(&canonical_target)?.with_context(|| {
-        format!(
-            "no stored snapshot found for {} in {}. run `gdu-diff shot {}` first",
-            canonical_target.display(),
-            store.data_dir().display(),
-            canonical_target.display()
-        )
-    })?;
+    let latest_path = store
+        .find_nth_latest_path_for(&canonical_target, 1)?
+        .with_context(|| {
+            format!(
+                "no stored snapshot found for {} in {}. run `gdu-diff shot {}` first",
+                canonical_target.display(),
+                store.data_dir().display(),
+                canonical_target.display()
+            )
+        })?;
+    let latest_detail = format!("Reading {}", latest_path.display());
+    let latest_snapshot = load_snapshot_with_fake_progress(
+        latest_path,
+        Some(String::from("latest")),
+        session,
+        loading,
+        latest_detail,
+        0.0,
+        1.0,
+    )?;
+    loading.set_detail(format!(
+        "Loaded latest stored snapshot for {}",
+        canonical_target.display()
+    ));
     loading.set_step_progress(1.0);
 
     loading.set_step(
@@ -286,7 +301,7 @@ fn load_diff_target(
         1.0,
     )?;
 
-    Ok(vec![latest.snapshot, current])
+    Ok(vec![latest_snapshot, current])
 }
 
 fn load_snapshot_with_fake_progress(
@@ -362,12 +377,30 @@ fn format_estimated_duration(duration: Duration) -> String {
     }
 }
 
-fn total_steps_for_action(action: &Action) -> usize {
+fn loading_steps_for_action(action: &Action) -> Vec<LoadingStep> {
     match action {
-        Action::CompareFiles { .. } => 3,
-        Action::CompareCurrentWithFile { .. } => 6,
-        Action::DiffTarget { .. } => 6,
-        Action::Shot { .. } => 1,
+        Action::CompareFiles { .. } => vec![
+            LoadingStep::new("Load snapshots", 6.0),
+            LoadingStep::new("Build analysis", 5.0),
+            LoadingStep::new("Prepare interface", 1.0),
+        ],
+        Action::CompareCurrentWithFile { .. } => vec![
+            LoadingStep::new("Load baseline snapshot", 4.0),
+            LoadingStep::new("Resolve target directory", 0.5),
+            LoadingStep::new("Scan current directory", 8.0),
+            LoadingStep::new("Load current snapshot", 4.0),
+            LoadingStep::new("Build analysis", 5.0),
+            LoadingStep::new("Prepare interface", 1.0),
+        ],
+        Action::DiffTarget { .. } => vec![
+            LoadingStep::new("Resolve target directory", 0.5),
+            LoadingStep::new("Load latest stored snapshot", 4.0),
+            LoadingStep::new("Scan current directory", 8.0),
+            LoadingStep::new("Load current snapshot", 4.0),
+            LoadingStep::new("Build analysis", 5.0),
+            LoadingStep::new("Prepare interface", 1.0),
+        ],
+        Action::Shot { .. } => vec![LoadingStep::new("Save snapshot", 1.0)],
     }
 }
 
