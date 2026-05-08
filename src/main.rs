@@ -16,7 +16,7 @@ use tokio::time::{Instant, interval, sleep};
 use analysis::{Analysis, SizeMetric};
 use gdu::{SnapshotTree, export_snapshot_with_progress};
 use store::{SnapshotStore, canonicalize_dir};
-use tui::{App, LoadingState, LoadingStep, TerminalSession};
+use tui::{App, LoadingState, LoadingStep, RefreshState, TerminalSession};
 
 const LOADING_DRAW_THROTTLE: Duration = Duration::from_millis(80);
 const JSON_LOAD_PROGRESS_TICK: Duration = Duration::from_millis(16);
@@ -93,9 +93,12 @@ async fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     loading.set_step(1, action_title(&action), "Preparing inputs");
     session.draw_loading(&loading)?;
 
-    let snapshots = match action {
+    let (snapshots, refresh_state) = match action {
         Action::CompareFiles { references } => {
-            load_compare_files(references, &mut session, &mut loading).await?
+            (
+                load_compare_files(references, &mut session, &mut loading).await?,
+                None,
+            )
         }
         Action::CompareCurrentWithFile { reference, target } => {
             load_compare_current_with_file(reference, target, &mut session, &mut loading).await?
@@ -138,7 +141,11 @@ async fn run_with_loading(action: Action, cli: &Cli) -> Result<()> {
     );
     session.draw_loading(&loading)?;
 
-    let mut app = App::new(analysis, metric, !cli.dirs_only)?;
+    let mut app = if let Some(refresh_state) = refresh_state {
+        App::new_with_refresh(analysis, metric, !cli.dirs_only, Some(refresh_state))?
+    } else {
+        App::new(analysis, metric, !cli.dirs_only)?
+    };
     session.run_app(&mut app).await
 }
 
@@ -189,7 +196,7 @@ async fn load_compare_current_with_file(
     target: PathBuf,
     session: &mut TerminalSession,
     loading: &mut LoadingState,
-) -> Result<Vec<SnapshotTree>> {
+) -> Result<(Vec<SnapshotTree>, Option<RefreshState>)> {
     let file = resolve_snapshot_reference(&reference, &target).await?;
     loading.set_step(
         1,
@@ -244,14 +251,15 @@ async fn load_compare_current_with_file(
     )
     .await?;
 
-    Ok(vec![snapshot, current])
+    let refresh_state = RefreshState::new(snapshot.clone(), current.clone(), canonical_target);
+    Ok((vec![snapshot, current], Some(refresh_state)))
 }
 
 async fn load_diff_target(
     target: PathBuf,
     session: &mut TerminalSession,
     loading: &mut LoadingState,
-) -> Result<Vec<SnapshotTree>> {
+) -> Result<(Vec<SnapshotTree>, Option<RefreshState>)> {
     loading.set_step(
         1,
         String::from("Resolve target directory"),
@@ -329,7 +337,9 @@ async fn load_diff_target(
     )
     .await?;
 
-    Ok(vec![latest_snapshot, current])
+    let refresh_state =
+        RefreshState::new(latest_snapshot.clone(), current.clone(), canonical_target);
+    Ok((vec![latest_snapshot, current], Some(refresh_state)))
 }
 
 async fn load_snapshot_with_progress(

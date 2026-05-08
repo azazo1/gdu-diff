@@ -20,15 +20,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap,
 };
+use tempfile::tempdir;
+use tokio::sync::mpsc;
 use tokio::time::interval;
 
 use crate::analysis::{Analysis, ChangeKind, RowData, SizeMetric, SortMode};
+use crate::gdu::{SnapshotTree, export_snapshot_with_progress};
+
+const REFRESH_DRAW_THROTTLE: Duration = Duration::from_millis(80);
+const REFRESH_PROGRESS_TICK: Duration = Duration::from_millis(16);
+const REFRESH_PROGRESS_CAP: f64 = 0.95;
+const REFRESH_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(8);
 
 pub struct App {
     analysis: Analysis,
     metric: SizeMetric,
     sort: SortMode,
     include_files: bool,
+    refresh_state: Option<RefreshState>,
     current_path: String,
     rows: Vec<RowData>,
     marked_paths: BTreeSet<String>,
@@ -194,11 +203,21 @@ impl Drop for TerminalSession {
 
 impl App {
     pub fn new(analysis: Analysis, metric: SizeMetric, include_files: bool) -> Result<Self> {
+        Self::new_with_refresh(analysis, metric, include_files, None)
+    }
+
+    pub fn new_with_refresh(
+        analysis: Analysis,
+        metric: SizeMetric,
+        include_files: bool,
+        refresh_state: Option<RefreshState>,
+    ) -> Result<Self> {
         let mut app = Self {
             analysis,
             metric,
             sort: SortMode::Delta,
             include_files,
+            refresh_state,
             current_path: String::new(),
             rows: Vec::new(),
             marked_paths: BTreeSet::new(),
@@ -293,6 +312,9 @@ impl App {
             KeyCode::Char('c') => return Ok(AppAction::Copy(self.copy_relative_path())),
             KeyCode::Char('C') => return Ok(AppAction::Copy(self.copy_absolute_path())),
             KeyCode::Char('b') => return Ok(AppAction::OpenShell(self.current_directory_path())),
+            KeyCode::Char('r') if self.refresh_state.is_some() => {
+                return Ok(AppAction::RefreshCurrentSubtree)
+            }
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
@@ -395,6 +417,46 @@ impl App {
 
     fn current_directory_path(&self) -> PathBuf {
         PathBuf::from(self.analysis.display_path(&self.current_path))
+    }
+
+    fn current_refresh_target_path(&self) -> String {
+        self.selected_row()
+            .filter(|row| row.has_children())
+            .map(|row| row.path.clone())
+            .unwrap_or_else(|| self.current_path.clone())
+    }
+
+    fn apply_refreshed_current_snapshot(
+        &mut self,
+        analysis: Analysis,
+        current: SnapshotTree,
+    ) -> Result<()> {
+        let Some(refresh_state) = &mut self.refresh_state else {
+            bail!("current refresh is not available in this mode");
+        };
+        refresh_state.current = current;
+
+        let selected_path = self.selected_row().map(|row| row.path.clone());
+        let current_path = self.current_path.clone();
+        self.analysis = analysis;
+
+        if !self.path_exists(&current_path) {
+            self.current_path = nearest_existing_parent(&self.analysis, &current_path);
+        }
+
+        let visible_paths = self
+            .marked_paths
+            .iter()
+            .filter(|path| self.path_exists(path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.marked_paths = visible_paths;
+        self.refresh_rows_with_selection(selected_path)?;
+        Ok(())
+    }
+
+    fn path_exists(&self, path: &str) -> bool {
+        self.analysis.row_for_path(path, self.metric).is_ok()
     }
 
     fn set_status(&mut self, text: String, kind: StatusKind) {
@@ -869,6 +931,7 @@ impl App {
             Line::from("Space toggles the current row in the marked set, then moves down"),
             Line::from("c copies relative path, C copies absolute path"),
             Line::from("b opens a shell in the current view directory"),
+            Line::from("r rescans the selected directory, or the current view when nothing is selected"),
             Line::from("Esc clears marked rows, or closes this help"),
             Line::from("Entering or leaving a directory also clears the marked set"),
             Line::from("q quits"),
@@ -969,6 +1032,14 @@ async fn run_loop(
                             AppAction::None => {}
                             AppAction::Copy(copy) => copy_to_clipboard(app, copy).await,
                             AppAction::OpenShell(path) => open_shell(terminal, app, &path).await?,
+                            AppAction::RefreshCurrentSubtree => {
+                                if let Err(error) = refresh_current_subtree(terminal, app).await {
+                                    app.set_status(
+                                        format!("Refresh failed: {error:#}"),
+                                        StatusKind::Error,
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
@@ -979,6 +1050,113 @@ async fn run_loop(
             _ = redraw.tick() => {}
         }
     }
+}
+
+enum RefreshScanUpdate {
+    Detail(String),
+    Finished(Result<()>),
+}
+
+async fn refresh_current_subtree(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    let refresh_path = app.current_refresh_target_path();
+    let refresh_display_path = app.analysis.display_path(&refresh_path);
+    let refresh_target = {
+        let refresh_state = app
+            .refresh_state
+            .as_ref()
+            .context("current refresh is not available in this mode")?;
+        absolute_refresh_target(&refresh_state.target_dir, &refresh_path)
+    };
+
+    let mut loading = LoadingState::new(
+        "gdu-diff",
+        vec![
+            LoadingStep::new("Scan current directory", 8.0),
+            LoadingStep::new("Load refreshed snapshot", 4.0),
+            LoadingStep::new("Rebuild analysis", 5.0),
+            LoadingStep::new("Restore view", 1.0),
+        ],
+    );
+    loading.set_step(
+        1,
+        String::from("Scan current directory"),
+        format!("Launching gdu-go for {}", refresh_target.display()),
+    );
+    draw_loading_in_terminal(terminal, &loading)?;
+
+    let temp_dir = tempdir().context("failed to create temporary directory")?;
+    let output = temp_dir.path().join("current.json");
+    export_snapshot_with_fake_progress_in_terminal(
+        &refresh_target,
+        &output,
+        terminal,
+        &mut loading,
+        format!("Launching gdu-go for {}", refresh_target.display()),
+    )
+    .await?;
+
+    loading.set_step(
+        2,
+        String::from("Load refreshed snapshot"),
+        String::from("Parsing generated JSON"),
+    );
+    draw_loading_in_terminal(terminal, &loading)?;
+    let refreshed_subtree = SnapshotTree::load_with_label(output, String::from("current")).await?;
+    loading.set_step_progress(1.0);
+    draw_loading_in_terminal(terminal, &loading)?;
+
+    loading.set_step(
+        3,
+        String::from("Rebuild analysis"),
+        format!("Refreshing {}", refresh_display_path),
+    );
+    draw_loading_in_terminal(terminal, &loading)?;
+    let mut last_loading_draw = Some(Instant::now());
+
+    let (baseline, mut next_current) = {
+        let refresh_state = app
+            .refresh_state
+            .as_ref()
+            .context("current refresh is not available in this mode")?;
+        (refresh_state.baseline.clone(), refresh_state.current.clone())
+    };
+    next_current.replace_subtree(&refresh_path, refreshed_subtree)?;
+
+    let analysis = Analysis::new_with_progress(vec![baseline, next_current.clone()], |progress| {
+        loading.set_step_progress(progress.overall_progress());
+        loading.set_detail(format!(
+            "Indexing snapshot {}/{}: {} ({:.0}%)\nCurrent path: {}",
+            progress.snapshot_index,
+            progress.snapshot_total,
+            progress.snapshot_label,
+            progress.snapshot_progress * 100.0,
+            progress.current_path
+        ));
+        let _ = draw_loading_throttled_in_terminal(
+            terminal,
+            &loading,
+            REFRESH_DRAW_THROTTLE,
+            &mut last_loading_draw,
+        );
+    })?;
+    loading.set_step_progress(1.0);
+    draw_loading_in_terminal(terminal, &loading)?;
+
+    loading.set_step(
+        4,
+        String::from("Restore view"),
+        format!("Restoring {}", app.analysis.display_path(&app.current_path)),
+    );
+    draw_loading_in_terminal(terminal, &loading)?;
+    app.apply_refreshed_current_snapshot(analysis, next_current)?;
+    loading.set_step_progress(1.0);
+    draw_loading_in_terminal(terminal, &loading)?;
+
+    app.set_status(format!("Refreshed {refresh_display_path}"), StatusKind::Info);
+    Ok(())
 }
 
 async fn copy_to_clipboard(app: &mut App, copy: CopyAction) {
@@ -1237,6 +1415,114 @@ fn mini_progress_bar(progress: f64, width: usize) -> String {
     bar
 }
 
+fn draw_loading_in_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    loading: &LoadingState,
+) -> Result<()> {
+    terminal.draw(|frame| render_loading(frame, loading))?;
+    Ok(())
+}
+
+fn draw_loading_throttled_in_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    loading: &LoadingState,
+    throttle: Duration,
+    last_draw: &mut Option<Instant>,
+) -> Result<()> {
+    if last_draw.is_some_and(|last| last.elapsed() < throttle) {
+        return Ok(());
+    }
+    terminal.draw(|frame| render_loading(frame, loading))?;
+    *last_draw = Some(Instant::now());
+    Ok(())
+}
+
+async fn export_snapshot_with_fake_progress_in_terminal(
+    target: &Path,
+    output: &Path,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    loading: &mut LoadingState,
+    detail: String,
+) -> Result<()> {
+    let target = target.to_path_buf();
+    let output = output.to_path_buf();
+    let display_target = target.display().to_string();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+
+    loading.set_step_progress(0.0);
+    loading.set_detail(detail);
+    draw_loading_in_terminal(terminal, loading)?;
+
+    let task = tokio::spawn(async move {
+        let progress_sender = sender.clone();
+        let result = export_snapshot_with_progress(&target, &output, |progress| {
+            let _ = progress_sender.send(RefreshScanUpdate::Detail(progress.to_string()));
+        })
+        .await;
+        let _ = sender.send(RefreshScanUpdate::Finished(result));
+    });
+
+    let started_at = Instant::now();
+    let mut ticker = interval(REFRESH_PROGRESS_TICK);
+    let mut last_draw = Some(Instant::now());
+    loop {
+        tokio::select! {
+            maybe_update = receiver.recv() => {
+                match maybe_update {
+                    Some(RefreshScanUpdate::Detail(detail)) => loading.set_detail(detail),
+                    Some(RefreshScanUpdate::Finished(result)) => {
+                        loading.set_step_progress(1.0);
+                        draw_loading_in_terminal(terminal, loading)?;
+                        task.await.context("background gdu export task panicked")?;
+                        return result;
+                    }
+                    None => {
+                        task.await.context("background gdu export task panicked")?;
+                        bail!("background gdu export exited unexpectedly while scanning {display_target}");
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                loading.set_step_progress(refresh_fake_progress(started_at.elapsed()));
+                let _ = draw_loading_throttled_in_terminal(
+                    terminal,
+                    loading,
+                    REFRESH_DRAW_THROTTLE,
+                    &mut last_draw,
+                );
+            }
+        }
+    }
+}
+
+fn refresh_fake_progress(elapsed: Duration) -> f64 {
+    let ratio =
+        (elapsed.as_secs_f64() / REFRESH_PROGRESS_SETTLE_TIME.as_secs_f64()).clamp(0.0, 1.0);
+    let eased_ratio = 1.0 - (1.0 - ratio).powi(2);
+    (REFRESH_PROGRESS_CAP * eased_ratio).clamp(0.0, REFRESH_PROGRESS_CAP)
+}
+
+fn absolute_refresh_target(root: &Path, relative_path: &str) -> PathBuf {
+    if relative_path.is_empty() {
+        return root.to_path_buf();
+    }
+    root.join(relative_path)
+}
+
+fn nearest_existing_parent(analysis: &Analysis, path: &str) -> String {
+    let mut current = path.to_string();
+    loop {
+        if analysis.row_for_path(&current, SizeMetric::Disk).is_ok() {
+            return current;
+        }
+
+        let Some(parent) = Analysis::parent_path(&current) else {
+            return String::new();
+        };
+        current = parent;
+    }
+}
+
 fn share_style(delta: f64) -> Style {
     if delta > 0.0 {
         Style::default().fg(Color::Red)
@@ -1318,6 +1604,24 @@ enum AppAction {
     None,
     Copy(CopyAction),
     OpenShell(PathBuf),
+    RefreshCurrentSubtree,
+}
+
+#[derive(Clone)]
+pub struct RefreshState {
+    baseline: SnapshotTree,
+    current: SnapshotTree,
+    target_dir: PathBuf,
+}
+
+impl RefreshState {
+    pub fn new(baseline: SnapshotTree, current: SnapshotTree, target_dir: PathBuf) -> Self {
+        Self {
+            baseline,
+            current,
+            target_dir,
+        }
+    }
 }
 
 impl SelectedDetail {
@@ -1732,7 +2036,7 @@ mod tests {
 
     use ratatui::layout::Rect;
 
-    use super::{App, AppAction, should_show_selected_panel};
+    use super::{App, AppAction, RefreshState, should_show_selected_panel};
 
     #[test]
     fn go_parent_reselects_the_directory_we_came_from() -> Result<()> {
@@ -1890,6 +2194,86 @@ mod tests {
         assert_eq!(app.marked_paths.len(), 2);
         assert_eq!(app.marked_summary().map(|summary| summary.count), Some(2));
 
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_target_prefers_selected_directory() -> Result<()> {
+        let first = SnapshotTree::from_json_str(
+            "first".into(),
+            PathBuf::from("first.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":10,"dsize":10,"mtime":1}],{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let second = SnapshotTree::from_json_str(
+            "current".into(),
+            PathBuf::from("second.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"one.bin","asize":20,"dsize":20,"mtime":1}],{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![first.clone(), second.clone()])?;
+        let mut app = App::new_with_refresh(
+            analysis,
+            SizeMetric::Disk,
+            true,
+            Some(RefreshState::new(first, second, PathBuf::from("/root"))),
+        )?;
+        app.sort = SortMode::Name;
+        app.refresh_rows()?;
+        let selected_index = app
+            .rows
+            .iter()
+            .position(|row| row.path == "a")
+            .expect("directory a should exist");
+        app.table_state.select(Some(selected_index));
+
+        assert_eq!(app.current_refresh_target_path(), "a");
+        Ok(())
+    }
+
+    #[test]
+    fn applying_refreshed_snapshot_updates_rows_and_keeps_selection() -> Result<()> {
+        let baseline = SnapshotTree::from_json_str(
+            "baseline".into(),
+            PathBuf::from("baseline.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"old.bin","asize":10,"dsize":10,"mtime":1}],{"name":"b.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+        let current = SnapshotTree::from_json_str(
+            "current".into(),
+            PathBuf::from("current.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":20},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"old.bin","asize":12,"dsize":12,"mtime":1}],{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+        let refreshed = SnapshotTree::from_json_str(
+            "current".into(),
+            PathBuf::from("refresh.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":30},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},{"name":"new.bin","asize":40,"dsize":40,"mtime":1}],{"name":"b.bin","asize":7,"dsize":7,"mtime":1}]]"#,
+        )?;
+
+        let analysis = Analysis::new(vec![baseline.clone(), current.clone()])?;
+        let mut app = App::new_with_refresh(
+            analysis,
+            SizeMetric::Disk,
+            true,
+            Some(RefreshState::new(
+                baseline.clone(),
+                current.clone(),
+                PathBuf::from("/root"),
+            )),
+        )?;
+        app.sort = SortMode::Name;
+        app.refresh_rows()?;
+        let selected_index = app
+            .rows
+            .iter()
+            .position(|row| row.path == "a")
+            .expect("directory a should exist");
+        app.table_state.select(Some(selected_index));
+
+        let updated_analysis = Analysis::new(vec![baseline, refreshed.clone()])?;
+        app.apply_refreshed_current_snapshot(updated_analysis, refreshed)?;
+
+        assert_eq!(app.selected_row().map(|row| row.path.as_str()), Some("a"));
+        let refreshed_row = app.analysis.row_for_path("a", SizeMetric::Disk)?;
+        assert_eq!(refreshed_row.latest_size, 40);
         Ok(())
     }
 

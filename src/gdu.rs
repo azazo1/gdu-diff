@@ -79,6 +79,81 @@ impl SnapshotTree {
             root,
         })
     }
+
+    pub fn replace_subtree(&mut self, path: &str, replacement: SnapshotTree) -> Result<()> {
+        let replacement_name = self.node_name_at_path(path)?;
+        let replacement_root = replacement.into_root_with_name(replacement_name)?;
+
+        if path.is_empty() {
+            self.root = replacement_root;
+            return Ok(());
+        }
+
+        let components = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        replace_child_subtree(&mut self.root, &components, path, replacement_root)
+    }
+
+    fn node_name_at_path(&self, path: &str) -> Result<String> {
+        if path.is_empty() {
+            return Ok(self.root.name().to_string());
+        }
+
+        let mut node = &self.root;
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            let GduNode::Dir(dir) = node else {
+                bail!("path {path} is not a directory");
+            };
+            node = dir
+                .children
+                .iter()
+                .find(|child| child.name() == component)
+                .with_context(|| format!("path {path} does not exist in snapshot {}", self.label))?;
+        }
+
+        Ok(node.name().to_string())
+    }
+
+    fn into_root_with_name(mut self, name: String) -> Result<GduNode> {
+        let GduNode::Dir(dir) = &mut self.root else {
+            bail!("snapshot {} root node is not a directory", self.label);
+        };
+        dir.name = name;
+        Ok(self.root)
+    }
+}
+
+fn replace_child_subtree(
+    node: &mut GduNode,
+    components: &[&str],
+    path: &str,
+    replacement: GduNode,
+) -> Result<()> {
+    let GduNode::Dir(dir) = node else {
+        bail!("path {path} is not a directory");
+    };
+
+    let Some((component, rest)) = components.split_first() else {
+        bail!("path {path} is empty");
+    };
+
+    let child = dir
+        .children
+        .iter_mut()
+        .find(|child| child.name() == *component)
+        .with_context(|| format!("path {path} does not exist"))?;
+
+    if rest.is_empty() {
+        if !matches!(child, GduNode::Dir(_)) {
+            bail!("path {path} is not a directory");
+        }
+        *child = replacement;
+        return Ok(());
+    }
+
+    replace_child_subtree(child, rest, path, replacement)
 }
 
 fn load_snapshot_tree(label: String, path: PathBuf) -> Result<SnapshotTree> {
@@ -412,5 +487,39 @@ mod tests {
             PathBuf::from("/tmp/current.json.zst")
         );
         assert_eq!(SNAPSHOT_FILE_SUFFIX, ".json.zst");
+    }
+
+    #[test]
+    fn replaces_nested_subtree_and_keeps_directory_name() -> Result<()> {
+        let mut current = SnapshotTree::from_json_str(
+            "current".into(),
+            PathBuf::from("current.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":42},[{"name":"/root","mtime":1},[{"name":"a","mtime":1},[{"name":"nested","mtime":1},{"name":"old.bin","asize":10,"dsize":10,"mtime":1}]],{"name":"keep.bin","asize":3,"dsize":3,"mtime":1}]]"#,
+        )?;
+        let replacement = SnapshotTree::from_json_str(
+            "current".into(),
+            PathBuf::from("replacement.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":50},[{"name":"/tmp/a","mtime":1},[{"name":"nested","mtime":1},{"name":"new.bin","asize":30,"dsize":30,"mtime":1}],{"name":"child.bin","asize":5,"dsize":5,"mtime":1}]]"#,
+        )?;
+
+        current.replace_subtree("a", replacement)?;
+
+        let GduNode::Dir(root) = &current.root else {
+            panic!("root must be a directory");
+        };
+        let GduNode::Dir(a_dir) = root
+            .children
+            .iter()
+            .find(|child| child.name() == "a")
+            .expect("a should exist after replacement")
+        else {
+            panic!("a must be a directory");
+        };
+
+        assert_eq!(a_dir.name, "a");
+        assert!(a_dir.children.iter().any(|child| child.name() == "nested"));
+        assert!(a_dir.children.iter().any(|child| child.name() == "child.bin"));
+        assert!(!a_dir.children.iter().any(|child| child.name() == "old.bin"));
+        Ok(())
     }
 }
