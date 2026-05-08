@@ -12,6 +12,7 @@ use tokio::process::Command;
 pub const COMPRESSED_SNAPSHOT_EXTENSION: &str = "zst";
 pub const SNAPSHOT_FILE_SUFFIX: &str = ".json.zst";
 const GDU_EXPORT_EXTENSION: &str = "json";
+const SHOT_ZSTD_COMPRESSION_LEVEL: i32 = 9;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotTree {
@@ -251,7 +252,20 @@ pub async fn export_snapshot_with_progress<F>(
 where
     F: FnMut(&str),
 {
-    if output.extension().and_then(|extension| extension.to_str()) != Some(COMPRESSED_SNAPSHOT_EXTENSION)
+    let output_kind = snapshot_output_kind(output).with_context(|| {
+        format!(
+            "snapshot output must use either .json or {}: {}",
+            SNAPSHOT_FILE_SUFFIX,
+            output.display()
+        )
+    })?;
+    let temp_output = match output_kind {
+        SnapshotOutputKind::PlainJson => output.to_path_buf(),
+        SnapshotOutputKind::CompressedZstd => raw_snapshot_temp_path(output),
+    };
+
+    if matches!(output_kind, SnapshotOutputKind::CompressedZstd)
+        && output.extension().and_then(|extension| extension.to_str()) != Some(COMPRESSED_SNAPSHOT_EXTENSION)
     {
         bail!(
             "snapshot output must use the {} suffix: {}",
@@ -259,8 +273,6 @@ where
             output.display()
         );
     }
-
-    let temp_output = raw_snapshot_temp_path(output);
     let candidates = ["gdu-go", "gdu"];
     let mut not_found = Vec::new();
 
@@ -303,8 +315,10 @@ where
                     )
                 })?;
                 if result.status.success() {
-                    compress_snapshot_file(&temp_output, output).await?;
-                    let _ = fs::remove_file(&temp_output).await;
+                    if matches!(output_kind, SnapshotOutputKind::CompressedZstd) {
+                        compress_snapshot_file(&temp_output, output).await?;
+                        let _ = fs::remove_file(&temp_output).await;
+                    }
                     return Ok(());
                 }
                 let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
@@ -348,8 +362,20 @@ pub fn is_zstd_snapshot_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(COMPRESSED_SNAPSHOT_EXTENSION))
 }
 
-pub fn snapshot_output_path(path: &Path) -> PathBuf {
-    path.with_extension(format!("{GDU_EXPORT_EXTENSION}.{COMPRESSED_SNAPSHOT_EXTENSION}"))
+enum SnapshotOutputKind {
+    PlainJson,
+    CompressedZstd,
+}
+
+fn snapshot_output_kind(path: &Path) -> Result<SnapshotOutputKind> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if file_name.ends_with(SNAPSHOT_FILE_SUFFIX) {
+        return Ok(SnapshotOutputKind::CompressedZstd);
+    }
+    if file_name.ends_with(".json") {
+        return Ok(SnapshotOutputKind::PlainJson);
+    }
+    bail!("unsupported snapshot output path")
 }
 
 fn strip_snapshot_suffix(name: &str) -> &str {
@@ -376,7 +402,7 @@ pub(crate) fn compress_snapshot_file_blocking(input: &Path, output: &Path) -> Re
     let destination = File::create(output)
         .with_context(|| format!("failed to create snapshot file {}", output.display()))?;
     let mut reader = StdBufReader::new(source);
-    let level = *zstd::compression_level_range().end();
+    let level = snapshot_compression_level();
     let mut encoder = zstd::stream::Encoder::new(BufWriter::new(destination), level)
         .with_context(|| format!("failed to initialize zstd encoder for {}", output.display()))?;
     std::io::copy(&mut reader, &mut encoder).with_context(|| {
@@ -392,6 +418,11 @@ pub(crate) fn compress_snapshot_file_blocking(input: &Path, output: &Path) -> Re
     Ok(())
 }
 
+fn snapshot_compression_level() -> i32 {
+    let range = zstd::compression_level_range();
+    SHOT_ZSTD_COMPRESSION_LEVEL.clamp(*range.start(), *range.end())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -401,8 +432,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        GduNode, SNAPSHOT_FILE_SUFFIX, SnapshotTree, compress_snapshot_file_blocking,
-        is_zstd_snapshot_path, snapshot_output_path,
+        COMPRESSED_SNAPSHOT_EXTENSION, GDU_EXPORT_EXTENSION, GduNode, SNAPSHOT_FILE_SUFFIX,
+        SnapshotTree, compress_snapshot_file_blocking, is_zstd_snapshot_path,
     };
 
     #[test]
@@ -448,9 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn builds_compressed_snapshot_output_path() {
+    fn compressed_snapshot_suffix_is_stable() {
         assert_eq!(
-            snapshot_output_path(Path::new("/tmp/current.json")),
+            Path::new("/tmp/current.json")
+                .with_extension(format!("{GDU_EXPORT_EXTENSION}.{COMPRESSED_SNAPSHOT_EXTENSION}")),
             PathBuf::from("/tmp/current.json.zst")
         );
         assert_eq!(SNAPSHOT_FILE_SUFFIX, ".json.zst");

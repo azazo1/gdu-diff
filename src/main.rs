@@ -14,9 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 
 use analysis::{Analysis, SizeMetric};
-use gdu::{
-    SnapshotLoadProgress, SnapshotTree, export_snapshot_with_progress, snapshot_output_path,
-};
+use gdu::{SnapshotLoadProgress, SnapshotTree, export_snapshot_with_progress};
 use store::{SnapshotStore, canonicalize_dir};
 use tui::{App, LoadingState, LoadingStep, TerminalSession};
 
@@ -220,7 +218,7 @@ async fn load_compare_current_with_file(
     );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
-    let current_path = snapshot_output_path(&temp_dir.path().join("current.json"));
+    let current_path = temp_dir.path().join("current.json");
     export_snapshot_with_fake_progress(
         &canonical_target,
         &current_path,
@@ -305,7 +303,7 @@ async fn load_diff_target(
     );
     session.draw_loading(loading)?;
     let temp_dir = tempdir().context("failed to create temporary directory")?;
-    let current_path = snapshot_output_path(&temp_dir.path().join("current.json"));
+    let current_path = temp_dir.path().join("current.json");
     export_snapshot_with_fake_progress(
         &canonical_target,
         &current_path,
