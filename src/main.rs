@@ -26,7 +26,7 @@ const JSON_LOAD_ESTIMATE_SAFETY_FACTOR: f64 = 1.5;
 const JSON_LOAD_ESTIMATE_MIN: Duration = Duration::from_millis(250);
 const SCAN_PROGRESS_TICK: Duration = Duration::from_millis(16);
 const SCAN_PROGRESS_CAP: f64 = 0.95;
-const SCAN_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(8);
+const SCAN_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(20);
 
 #[derive(Parser, Debug)]
 #[command(
