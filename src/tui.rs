@@ -420,10 +420,7 @@ impl App {
     }
 
     fn current_refresh_target_path(&self) -> String {
-        self.selected_row()
-            .filter(|row| row.has_children())
-            .map(|row| row.path.clone())
-            .unwrap_or_else(|| self.current_path.clone())
+        self.current_path.clone()
     }
 
     fn apply_refreshed_current_snapshot(
@@ -931,7 +928,7 @@ impl App {
             Line::from("Space toggles the current row in the marked set, then moves down"),
             Line::from("c copies relative path, C copies absolute path"),
             Line::from("b opens a shell in the current view directory"),
-            Line::from("r rescans the selected directory, or the current view when nothing is selected"),
+            Line::from("r rescans the current view directory"),
             Line::from("Esc clears marked rows, or closes this help"),
             Line::from("Entering or leaving a directory also clears the marked set"),
             Line::from("q quits"),
@@ -2198,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_target_prefers_selected_directory() -> Result<()> {
+    fn refresh_target_uses_current_view_directory() -> Result<()> {
         let first = SnapshotTree::from_json_str(
             "first".into(),
             PathBuf::from("first.json"),
@@ -2226,6 +2223,9 @@ mod tests {
             .expect("directory a should exist");
         app.table_state.select(Some(selected_index));
 
+        assert_eq!(app.current_refresh_target_path(), "");
+
+        app.enter_selected()?;
         assert_eq!(app.current_refresh_target_path(), "a");
         Ok(())
     }

@@ -734,13 +734,14 @@ mod tests {
 
     #[test]
     fn scan_fake_progress_is_monotonic_and_caps_at_ninety_five() {
+        let settle_time = SCAN_PROGRESS_SETTLE_TIME;
         let checkpoints = [
             Duration::from_secs(0),
             Duration::from_secs(1),
             Duration::from_secs(2),
             Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(16),
+            settle_time,
+            Duration::from_secs_f64(settle_time.as_secs_f64() * 2.0),
         ];
         let values = checkpoints.map(fake_scan_progress);
 

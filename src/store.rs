@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dirs_next::data_dir;
 use tokio::fs;
 
-use crate::gdu::{SnapshotTree, SNAPSHOT_FILE_SUFFIX, export_snapshot};
+use crate::gdu::{GduNode, SnapshotTree, SNAPSHOT_FILE_SUFFIX, export_snapshot};
 
 const APPLICATION: &str = "gdu-diff";
 const MAX_BUCKET_NAME_LEN: usize = 120;
@@ -126,7 +126,11 @@ impl SnapshotStore {
             return Ok(());
         }
 
+        let protected_path = find_smallest_snapshot_path(&paths).await?;
         for path in paths.into_iter().skip(MAX_SHOTS_PER_BUCKET) {
+            if protected_path.as_ref() == Some(&path) {
+                continue;
+            }
             fs::remove_file(&path)
                 .await
                 .with_context(|| format!("failed to remove old snapshot {}", path.display()))?;
@@ -186,6 +190,26 @@ fn snapshot_name_sort_key(path: &Path) -> Option<(u64, u32)> {
         None => (suffix, 0),
     };
     Some((timestamp.parse().ok()?, ordinal))
+}
+
+async fn find_smallest_snapshot_path(paths: &[PathBuf]) -> Result<Option<PathBuf>> {
+    let mut smallest: Option<(u64, PathBuf)> = None;
+    for path in paths {
+        let snapshot = SnapshotTree::load_with_progress(path.clone(), || {}).await?;
+        let size = snapshot_disk_usage(&snapshot.root);
+        match &smallest {
+            Some((smallest_size, _)) if *smallest_size < size => {}
+            _ => smallest = Some((size, path.clone())),
+        }
+    }
+    Ok(smallest.map(|(_, path)| path))
+}
+
+fn snapshot_disk_usage(node: &GduNode) -> u64 {
+    match node {
+        GduNode::File(file) => file.disk_size,
+        GduNode::Dir(dir) => dir.children.iter().map(snapshot_disk_usage).sum(),
+    }
 }
 
 fn encode_bucket_name(input: &str) -> String {
@@ -258,7 +282,7 @@ fn unix_millis() -> Result<u128> {
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use anyhow::Result;
     use tempfile::tempdir;
@@ -267,7 +291,8 @@ mod tests {
 
     use super::{
         MAX_BUCKET_NAME_LEN, MAX_SHOTS_PER_BUCKET, SnapshotStore, canonicalize_dir,
-        compare_snapshot_path_order, encode_bucket_name,
+        compare_snapshot_path_order, encode_bucket_name, find_smallest_snapshot_path,
+        snapshot_disk_usage,
     };
 
     #[test]
@@ -416,12 +441,12 @@ mod tests {
         let bucket = snapshots_dir.join("bucket");
         fs::create_dir_all(&bucket)?;
 
-        for timestamp in [10, 20, 30, 40] {
+        for (timestamp, size) in [(10, 100), (20, 10), (30, 20), (40, 30)] {
             let path = bucket.join(format!("shot-{timestamp}.json.zst"));
             write_compressed_snapshot(
                 &path,
                 &format!(
-                    r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":1,"dsize":1,"mtime":1}}]]"#
+                    r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":{size},"dsize":{size},"mtime":1}}]]"#
                 ),
             )?;
         }
@@ -446,6 +471,79 @@ mod tests {
 
         assert_eq!(remaining.len(), MAX_SHOTS_PER_BUCKET);
         assert_eq!(remaining, vec![20, 30, 40]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_bucket_keeps_smallest_snapshot_even_if_it_is_oldest() -> Result<()> {
+        let dir = tempdir()?;
+        let snapshots_dir = dir.path().join("snapshots");
+        let bucket = snapshots_dir.join("bucket");
+        fs::create_dir_all(&bucket)?;
+
+        for (timestamp, size) in [(10, 1), (20, 20), (30, 30), (40, 40)] {
+            let path = bucket.join(format!("shot-{timestamp}.json.zst"));
+            write_compressed_snapshot(
+                &path,
+                &format!(
+                    r#"[1,2,{{"progname":"gdu","progver":"v0","timestamp":{timestamp}}},[{{"name":"/root","mtime":1}},{{"name":"a","asize":{size},"dsize":{size},"mtime":1}}]]"#
+                ),
+            )?;
+        }
+
+        let store = SnapshotStore {
+            data_dir: dir.path().to_path_buf(),
+            snapshots_dir,
+        };
+        store.prune_bucket(&bucket).await?;
+
+        let mut remaining = store
+            .list_ordered_snapshot_paths_in_bucket(&bucket)
+            .await?
+            .into_iter()
+            .filter_map(|path| {
+                snapshot_stem(&path)
+                    .and_then(|stem| stem.strip_prefix("shot-"))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .collect::<Vec<_>>();
+        remaining.sort_unstable();
+
+        assert_eq!(remaining, vec![10, 20, 30, 40]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finds_oldest_smallest_snapshot_when_sizes_tie() -> Result<()> {
+        let dir = tempdir()?;
+        let bucket = dir.path().join("bucket");
+        fs::create_dir_all(&bucket)?;
+        let first = bucket.join("shot-10.json.zst");
+        let second = bucket.join("shot-20.json.zst");
+
+        for path in [&first, &second] {
+            write_compressed_snapshot(
+                path,
+                r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},{"name":"a","asize":5,"dsize":5,"mtime":1}]]"#,
+            )?;
+        }
+
+        let ordered = vec![second.clone(), first.clone()];
+        let protected = find_smallest_snapshot_path(&ordered).await?;
+
+        assert_eq!(protected, Some(first));
+        Ok(())
+    }
+
+    #[test]
+    fn computes_snapshot_disk_usage_recursively() -> Result<()> {
+        let snapshot = SnapshotTree::from_json_str(
+            "latest".into(),
+            PathBuf::from("sample.json"),
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":10},[{"name":"/root","mtime":1},[{"name":"dir","mtime":1},{"name":"a","asize":1,"dsize":2,"mtime":1},{"name":"b","asize":1,"dsize":3,"mtime":1}],{"name":"c","asize":1,"dsize":5,"mtime":1}]]"#,
+        )?;
+
+        assert_eq!(snapshot_disk_usage(&snapshot.root), 10);
         Ok(())
     }
 
