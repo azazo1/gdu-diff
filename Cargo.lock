@@ -676,6 +676,7 @@ dependencies = [
  "dirs-next",
  "futures-util",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

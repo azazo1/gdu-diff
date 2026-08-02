@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -52,7 +53,9 @@ impl SnapshotTree {
     }
 
     pub fn from_json_str(label: String, source: PathBuf, content: &str) -> Result<Self> {
-        let value: Value = serde_json::from_str(content)
+        let mut deserializer = serde_json::Deserializer::from_str(content);
+        deserializer.disable_recursion_limit();
+        let value = Value::deserialize(&mut deserializer)
             .with_context(|| format!("failed to parse JSON from {}", source.display()))?;
         let top = value
             .as_array()
@@ -453,6 +456,45 @@ mod tests {
             }
             GduNode::File(_) => panic!("root must be a directory"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_deeply_nested_export_tree() -> Result<()> {
+        const DEPTH: usize = 300;
+        let mut json = String::from(
+            r#"[1,2,{"progname":"gdu","progver":"v0","timestamp":42},[{"name":"/root","mtime":1},"#,
+        );
+        for level in 1..=DEPTH {
+            json.push_str(&format!(r#"[{{"name":"d{level}","mtime":1}},"#));
+        }
+        json.push_str(r#"{"name":"leaf.bin","asize":10,"dsize":20,"mtime":1}"#);
+        for _ in 0..(DEPTH + 2) {
+            json.push(']');
+        }
+
+        let snapshot =
+            SnapshotTree::from_json_str("deep".into(), PathBuf::from("deep.json"), &json)?;
+
+        let mut current = &snapshot.root;
+        for level in 1..=DEPTH {
+            let GduNode::Dir(dir) = current else {
+                panic!("level {level} must be a directory");
+            };
+            let expected = format!("d{level}");
+            current = dir
+                .children
+                .iter()
+                .find(|child| child.name() == expected.as_str())
+                .expect("deep directory level should exist");
+        }
+        let GduNode::Dir(last) = current else {
+            panic!("deepest level must be a directory");
+        };
+        assert!(last
+            .children
+            .iter()
+            .any(|child| child.name() == "leaf.bin" && matches!(child, GduNode::File(_))));
         Ok(())
     }
 
