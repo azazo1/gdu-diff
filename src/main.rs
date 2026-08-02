@@ -31,7 +31,7 @@ const SCAN_PROGRESS_SETTLE_TIME: Duration = Duration::from_secs(20);
 #[derive(Parser, Debug)]
 #[command(
     name = "gdu-diff",
-    version,
+    version = env!("GDU_DIFF_BUILD_VERSION"),
     about = "Browse gdu snapshots, store shots, and compare current disk usage against history."
 )]
 struct Cli {

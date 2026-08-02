@@ -55,6 +55,12 @@
 cargo build
 ```
 
+发布用的 release 构建可以直接使用 `just`:
+
+```shell
+just dist
+```
+
 ### 运行测试
 
 ```bash
@@ -184,6 +190,28 @@ gdu-diff --dirs-only /path/to/dir
 每个被追踪的目录会映射到一个独立子目录。原始绝对路径不会直接作为文件名使用, 而是会被编码成安全的目录名, 避免非法字符和分隔符问题。过长的路径名会自动截断, 并追加稳定哈希, 避免单个目录名超过文件系统限制。
 
 默认保存的新 `shot` 文件后缀是 `.json.zst`。程序仍然兼容直接读取旧的 `.json` 快照, 当前对比流程中的临时快照则继续使用 `.json`。
+
+## 版本与发布
+
+`--version` 显示的版本号在构建时自动生成, 基础版本号跟随最近一个版本 tag:
+
+- 构建 commit 恰好是版本 tag 时, 直接显示该 tag, 例如 `v1.2.3`
+- 构建处于非 tag commit 时, 在最近 tag 后追加 `-` 和 6 位短 commit hash, 例如 `v1.2.3-a1b2c3`
+- 工作区还有未提交改动时, 分隔符改为 `^`, 例如 `v1.2.3^a1b2c3`
+
+发布流程:
+
+1. 在 `docs/changelog/` 下按版本号维护人工发布说明, 例如 `docs/changelog/0.1.0.md`
+2. 提交版本号和说明文件, 然后直接用说明文件创建 annotated tag, 例如:
+
+```shell
+git tag -a "v0.1.0" --cleanup=verbatim -F "docs/changelog/0.1.0.md"
+```
+
+3. push tag 后, GitHub Actions 会构建 Linux, Windows, macOS 的 x86_64 和 aarch64 产物, 校验 tag 与包版本一致, 检查 tag annotation 与说明文件完全一致, 再自动创建或更新 GitHub Release
+4. 也可以在 Actions 页面手动填写已有 tag 触发同一发布流程; tag 留空时只构建并上传 artifact, 不创建 release
+
+构建, 校验或产物完整性检查失败时不会创建公开 release; 重跑同一 tag 会更新已有 release 的正文并覆盖产物。
 
 ## 界面操作
 
